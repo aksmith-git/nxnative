@@ -2287,6 +2287,7 @@ static void up_blit_add_at(id<MTLBuffer> src, size_t off, size_t row, size_t ima
 }
 
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, MTLTextureUsage keep);
+_Atomic int dm_env_gen;   // bumped by DM_CTL "env" (hle_hid.c): switches that are read again then (DM_NVN_SKIP_CS)
 static int g_direct_upload_on = -1; static uint64_t g_direct_uploads, g_direct_dispatches;
 static int direct_upload_on(void) { if (g_direct_upload_on < 0) { const char *e=getenv("DM_NVN_DIRECT_UPLOAD"); g_direct_upload_on=!e||atoi(e); } return g_direct_upload_on; }
 int nvn_host_readable(uint64_t a, uint64_t n);   // hle_nvn.c: guest memory and sparse pools
@@ -2847,6 +2848,8 @@ static void msp_refresh(NvPkg *pk, const tex_t *t, int all) {
         nvn_sparse_protect(t->pool, a, n); j = k;
     }
     for (unsigned q = 0; q < ntails; q++) nvn_sparse_protect(t->pool, mem + tails[q] * m->layer_size + m->loff[m->nt], m->layer_size - m->loff[m->nt]);
+    static int noup = -1; if (noup < 0) { const char *e = getenv("DM_NVN_MSP_NOUP"); noup = e ? atoi(e) : 0; if (noup) MLOG("DM_NVN_MSP_NOUP=%d: sparse texture tiles are mapped but not written (diagnostic; 2 = the tails too)", noup); }
+    if (noup) { ntodo = 0; if (noup > 1) ntails = 0; }
     if (ntodo || ntails) {
         up_begin(); g_msp_batch = 0;
         static uint8_t tile[MSP_PAGE];
@@ -10483,9 +10486,10 @@ static void dispatch(const p_dispatch *dp) {
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
     // Diagnostic DM_NVN_SKIP_CS=<compute key prefix>[,…] (up to 64; `all` = every dispatch): drops those dispatches, the compute counterpart of DM_NVN_SKIP_FS, to bisect a
     // dispatch that hangs the GPU (Pokémon Pokopia's first 3D scene: kIOGPUCommandBufferCallbackErrorHang every frame). The picture is wrong
-    { static char sk[64][20]; static int nsk = -1, all;
+    { static char sk[256][20]; static int nsk = -1, all, gen;
+      if (gen != atomic_load_explicit(&dm_env_gen, memory_order_relaxed)) { gen = atomic_load(&dm_env_gen); nsk = -1; }   // DM_CTL "env" changed a switch: read it again
       if (nsk < 0) { nsk = 0; const char *e = getenv("DM_NVN_SKIP_CS"); all = e && !strcmp(e, "all");
-                     for (const char *q = all ? NULL : e; q && *q && nsk < 64; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
+                     for (const char *q = all ? NULL : e; q && *q && nsk < 256; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
                      if (nsk || all) MLOG("DM_NVN_SKIP_CS: dropping the dispatches of %s compute shaders (diagnostic; the picture is wrong)", all ? "all" : "the listed"); }
       if (all) return;
       for (int i = 0; i < nsk; i++) if (!strncmp(cs->key, sk[i], strlen(sk[i]))) return; }

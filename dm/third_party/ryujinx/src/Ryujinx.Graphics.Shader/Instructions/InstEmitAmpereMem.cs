@@ -337,13 +337,16 @@ namespace Ryujinx.Graphics.Shader.Instructions
         // The 32-bit address of a local / shared access: Ra plus the uniform register (at urLo in the uniform form, bit 91). A shared access with bit 78 scales Ra by 4
         // ([Ra.X4 + UR + offset]): Pokémon Pokopia has 1,879 STS, 1,352 LDS and its ATOMS.POPC.INC with it; its 64-bin histogram (e4ec13f79f9e0bd4) increments [R3.X4] with R3 = 0..63
         // in 256 bytes of shared memory. Read unscaled, those accesses landed on the wrong words. Local accesses never set the bit there
-        private static Operand ALocalAddress(EmitterContext context, AmpereOp x, int urLo, bool shared = false)
+        // The scale is the access size ([Ra.X8] for 64 bits, [Ra.X16] for 128): Mario Kart World's froxel shaders (03923de3c507135e and 35 variants) keep a float4 a thread at
+        // [R.X16 + 0x500]; scaled by 4, neighbouring threads' vectors overlapped, the volume's in-scattering and transmittance came out as 4x4-tile garbage and the whole race
+        // picture as rainbow bands by depth slice
+        private static Operand ALocalAddress(EmitterContext context, AmpereOp x, int urLo, bool shared = false, int scaleShift = 2)
         {
             Operand addr = Register(x.Ra, RegisterType.Gpr);
 
             if (shared && x.Bit(78) && x.Ra != RegisterConsts.RegisterZeroIndex)
             {
-                addr = context.ShiftLeft(addr, Const(2));
+                addr = context.ShiftLeft(addr, Const(scaleShift));
             }
 
             if (x.Bit(91) && x.Bits(urLo, urLo + 6) != RegisterConsts.UniformZeroIndex)
@@ -354,13 +357,23 @@ namespace Ryujinx.Graphics.Shader.Instructions
             return addr;
         }
 
+        // log2 of an access's size in bytes: the scale of [Ra.Xn] (ALocalAddress)
+        private static int ALsShift(LsSize2 size) => size switch
+        {
+            LsSize2.U8 or LsSize2.S8 => 0,
+            LsSize2.U16 or LsSize2.S16 => 1,
+            LsSize2.B64 => 3,
+            LsSize2.B128 or (LsSize2)7 => 4,
+            _ => 2,
+        };
+
         // LDL / LDS Rd, [Ra + UR + offset]: UR at 32, size 73..76, offset 40..64
         public static void ALdLocalShared(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
             StorageKind kind = x.Opcode == AmpereOpcodes.Ldl ? StorageKind.LocalMemory : StorageKind.SharedMemory;
 
-            EmitLoad(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 32, kind == StorageKind.SharedMemory), x.Rd, (int)x.SignedField(40, 64));
+            EmitLoad(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 32, kind == StorageKind.SharedMemory, ALsShift((LsSize2)x.Bits(73, 76))), x.Rd, (int)x.SignedField(40, 64));
         }
 
         // STL / STS [Ra + UR + offset], Rb: UR at 64
@@ -369,7 +382,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             AmpereOp x = new(context.CurrOp);
             StorageKind kind = x.Opcode is 0x387 or 0x987 ? StorageKind.LocalMemory : StorageKind.SharedMemory;
 
-            EmitStore(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 64, kind == StorageKind.SharedMemory), x.Rb, (int)x.SignedField(40, 64));
+            EmitStore(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 64, kind == StorageKind.SharedMemory, ALsShift((LsSize2)x.Bits(73, 76))), x.Rb, (int)x.SignedField(40, 64));
         }
 
         // ---- surfaces ----
