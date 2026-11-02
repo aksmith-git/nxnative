@@ -206,7 +206,8 @@ void hid_keys_init(void) {
 //   registered textures of that target (2 = 3D) with storage address and block-linear layout (nvn_mtl.m dm_gfx_texlist), "texraw <serial> <path>"
 //   saves a host texture's level 0 raw, every slice (a cube's six faces) (nvn_mtl.m dm_gfx_texraw), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
-//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "#…" is ignored.
+//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "players <mask>" connects the controllers of those players
+//   (bit 0 player 1; as the front end reports pads coming and going, dm_pad_players), "p<N> key[+key][~hold]" presses on player N's controller, "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
@@ -236,8 +237,13 @@ static void *ctl_main(void *arg) {
                     for (int i = 0; i <= n; i++) { dm_touch t = {0, x0 + (x1 - x0) * (float)i / (float)n, y0 + (y1 - y0) * (float)i / (float)n}; dm_touch_script(&t, 1); usleep((useconds_t)(s * 1e6f / (float)n)); }
                     dm_touch_script(NULL, 0); continue;
                 }
-                key_step st = {0, 0.15, 0}; char *h = strchr(line, '~'); if (h) { *h = 0; st.hold = atof(h + 1); }
-                parse_keys(line, &st);
+                if (!strncmp(line, "players ", 8)) { uint32_t m = (uint32_t)strtoul(line + 8, NULL, 0); dm_pad_players(m); LOG("DM_CTL: controllers connected %#x", m); continue; }
+                int pl = 0; char *ks = line;   // "p<N> keys": the keys on player N's controller (2..8; connect it first with "players")
+                if (line[0] == 'p' && line[1] >= '1' && line[1] <= '8' && line[2] == ' ') { pl = line[1] - '1'; ks = line + 3; }
+                key_step st = {0, 0.15, 0}; char *h = strchr(ks, '~'); if (h) { *h = 0; st.hold = atof(h + 1); }
+                parse_keys(ks, &st);
+                if (pl) { LOG("DM_CTL: player %d press %#llx (hold %.2f s)", pl + 1, (unsigned long long)st.btn, st.hold);
+                    dm_pad_set_player(pl, st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); dm_pad_set_player(pl, 0, 0, 0, 0, 0); continue; }
                 LOG("DM_CTL: press %#llx (hold %.2f s)", (unsigned long long)st.btn, st.hold);
                 if (st.tap) { dm_touch t = {0, st.tx, st.ty}; dm_touch_script(&t, 1); }
                 script_set(st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); script_set(0, 0, 0, 0, 0);
