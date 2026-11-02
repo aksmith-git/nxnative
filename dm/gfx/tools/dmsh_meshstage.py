@@ -70,14 +70,21 @@ def to_stage(msl, kind, info):
     call = f'dm_stage_body({", ".join(names + [arr])});'
     lay, thr, payw = info['mesh_layout'], info['threads'], (info['payload'] + 3) // 4
     sys_w, isbe_w, out_w, prim_b = lay[0] // 4, lay[1] // 4, lay[2] // 4, lay[3]
-    start = (f'    threadgroup spvUnsafeArray<uint, {words}> {arr};\n'
+    # The thread's and the threadgroup's positions: the kernel's own parameters when it has them (an attribute may be given once), else dm_lid / dm_tg of their own
+    own = {}
+    for p in params:
+        a = re.match(r'(uint3?)\s+(\w+)\s*\[\[(thread_position_in_threadgroup|threadgroup_position_in_grid)\]\]$', p)
+        if a: own[a.group(3)] = a.group(2) + ('.x' if a.group(1) == 'uint3' else '')
+    pos = ''.join(f', uint {v} [[{a}]]' for a, v in (('threadgroup_position_in_grid', 'dm_tg'), ('thread_position_in_threadgroup', 'dm_lid')) if a not in own)
+    alias = ''.join(f'    uint {v} = {own[a]};\n' for a, v in (('threadgroup_position_in_grid', 'dm_tg'), ('thread_position_in_threadgroup', 'dm_lid')) if a in own)
+    start = (alias + f'    threadgroup spvUnsafeArray<uint, {words}> {arr};\n'
              f'    for (uint i = dm_lid; i < {words}u; i += {thr}u) {arr}[i] = 0u;\n'
              f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n')
     head = f'struct dm_payload_t {{ uint w[{max(payw, 1)}]; }};\n'
     if kind == 'ts':
         return src + '\n' + head + (
-            f'[[object]] void main0({", ".join(params)}, object_data dm_payload_t& dm_pl [[payload]], mesh_grid_properties dm_mgp, '
-            f'uint dm_tg [[threadgroup_position_in_grid]], uint dm_lid [[thread_position_in_threadgroup]], constant uint* dm_first [[buffer(29)]])\n{{\n' + start +
+            f'[[object]] void main0({", ".join(params)}, object_data dm_payload_t& dm_pl [[payload]], mesh_grid_properties dm_mgp'
+            f'{pos}, constant uint* dm_first [[buffer(29)]])\n{{\n' + start +
             f'    if (dm_lid == 0u) {arr}[{sys_w}] = dm_first[0] + dm_tg;\n'
             f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n    {call}\n'
             f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n'
@@ -104,7 +111,7 @@ def to_stage(msl, kind, info):
         # With a task stage the mesh shader reads its number among the task's launches as payload word 0 (ISBERD mode 0x38 at 0: the task writes from +4), and the
         # payload from +0x10; with none (control +0x5e clear) it reads its number with mode 0x78, the draw's first group (buffer 29) added
         return (f'[[mesh]] void {name}({", ".join(params)}, dm_mesh_t dm_out, ' + ('const object_data dm_payload_t& dm_pl [[payload]], ' if task else '') +
-                f'uint dm_tg [[threadgroup_position_in_grid]], uint dm_lid [[thread_position_in_threadgroup]], constant uint* dm_first [[buffer(29)]])\n{{\n' + start +
+                f'{pos[2:]}{", " if pos else ""}constant uint* dm_first [[buffer(29)]])\n{{\n' + start +
                 (f'    for (uint i = dm_lid; i < {payw}u; i += {thr}u) {arr}[{isbe_w}u + i] = dm_pl.w[i];\n'
                  f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n'
                  f'    if (dm_lid == 0u) {{ {arr}[{sys_w}] = dm_tg; {arr}[{isbe_w}] = dm_tg; }}\n' if task else
