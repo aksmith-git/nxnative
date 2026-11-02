@@ -475,7 +475,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         }
 
         // SURED [Ra], Rb (0x59f): SUATOM without the old value (a reduction), its fields laid out as SUATOM's. Mario Kart World's compute shader ab77eaee44cfef88 counts
-        // into a 2D image with SURED.ADD.U32; untranslated, its dispatches were skipped and the race's picture came out overexposed in rainbow bands
+        // into a 2D image with SURED.ADD.U32; untranslated, the shader was missing and its dispatches skipped
         public static void ASured(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
