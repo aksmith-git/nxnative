@@ -35,7 +35,7 @@ enum { CV_VP8, CV_VP9, CV_H264 };
 typedef struct {
     uint32_t magic, id; pthread_mutex_t mu; vpx_codec_ctx_t vpx; int vpx_ok; void *event; uint64_t submits, pictures;
     int codec; uint16_t w, h; mavc *avc; uint8_t *csd; size_t csd_n;   // H.264: VideoToolbox and the parameter sets Initialize gave
-    struct { cv_pool *pool; uint32_t pidx; int reg, filled; uint32_t gen, filled_gen; uint16_t w, h; int64_t ts; uint8_t eos; } buf[CV_BUFS];
+    struct { cv_pool *pool; uint32_t pidx; int reg, filled; uint32_t gen, filled_gen; uint16_t w, h; int64_t ts; uint8_t eos, cs; } buf[CV_BUFS];   // cs: libvpx's colour space (vpx_color_space_t)
     uint32_t fifo[8], fhead, fcount;          // acquirable indices
     uint32_t pend[CV_BUFS], phead, pcount;    // released, waiting for a picture
     vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
@@ -84,7 +84,7 @@ static void drain(cv_dec *d) {
             vpx_image_t *im = d->held[0]; int64_t ts = d->held_ts[0]; uint8_t eos = d->held_eos[0];
             memmove(d->held, d->held + 1, sizeof d->held[0] * (CV_HOLD - 1)); memmove(d->held_ts, d->held_ts + 1, sizeof d->held_ts[0] * (CV_HOLD - 1));
             memmove(d->held_eos, d->held_eos + 1, CV_HOLD - 1); d->nheld--;
-            b->w = (uint16_t)im->d_w; b->h = (uint16_t)im->d_h; b->ts = ts; b->eos = eos;
+            b->w = (uint16_t)im->d_w; b->h = (uint16_t)im->d_h; b->ts = ts; b->eos = eos; b->cs = (uint8_t)im->cs;
             if (b->pool && b->pidx < b->pool->count) { if (b->pool->img[b->pidx]) vpx_img_free(b->pool->img[b->pidx]); b->pool->img[b->pidx] = im; } else vpx_img_free(im);
             if (!d->pictures++) LOG("[codec] %s decoder %u: first picture %ux%u into buffer %u", d->codec == CV_H264 ? "H.264" : d->codec == CV_VP8 ? "VP8" : "VP9", d->id, b->w, b->h, i);
         } else { b->w = b->h = 0; b->ts = 0; b->eos = 1; d->eos_pending = 0; }
@@ -281,6 +281,15 @@ static Result cv_dec_props(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch,
     pthread_mutex_unlock(&d->mu);
     return ok ? 0 : CV_NONE;
 }
+// The SDK 19 form also reports the picture's colour space (nn::movie::ColorSpace, taken here as 0 BT.601, 1 BT.709): BT.709 when the stream says so, or says nothing and the
+// picture is HD. Mario Kart World calls only this form; without it the SDK's own code ran on the host decoder (an IPC request on the 'DmCV' magic as its session handle) and
+// nn::diag aborted as its first course movie (VP9, 2560x1440) began
+static Result cv_dec_props_cs(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch, uint32_t *cs, int64_t *ts, bool *eos, void *t, uint32_t i) {
+    Result r = cv_dec_props(w, h, cw, ch, ts, eos, t, i);
+    cv_dec *d = cv_of(t);
+    if (!r && d && cs) { uint8_t c = d->buf[i].cs; *cs = c == VPX_CS_BT_709 || (c == VPX_CS_UNKNOWN && *h >= 720) ? 1 : 0; }
+    return r;
+}
 static Result cv_dec_encrypted(void) { static int once; if (!once++) LOG("[RED] nn::codec: an encrypted input buffer: protected streams are not served"); return CV_R(2004); }
 // Each decoder type's entry points, by their names in the SDK (the work buffer, the two Initialize overloads without the H.264 parameter sets, …)
 #define CV_FAMILY(tag, codec, s_work, s_init, s_init2, s_fin, s_reg, s_unreg, s_start, s_stop, s_flush, s_ev, s_sub, s_enc, s_acq, s_rel, s_props) \
@@ -331,6 +340,25 @@ CV_FAMILY(h264, CV_H264, "_ZN2nn5codec30CalculateH264DecoderWorkBufferEPmS1_mtt"
     "_ZN2nn5codec30AcquireH264DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_15H264DecoderTypeE", "_ZN2nn5codec30ReleaseH264DecoderOutputBufferEPNS0_15H264DecoderTypeEjNS_2gs16NativeSyncHandleE",
     "_ZN2nn5codec36GetH264DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_8TimeSpanEPbPNS0_15H264DecoderTypeEj")
 #undef CV_FAMILY
+// SDK 19's other forms (Mario Kart World): Initialize with two sizes and no work buffer, and the output properties with the colour space (cv_dec_props_cs)
+#define CV_SDK19(tag, codec, s_init3, s_props2) \
+    HLE_FORCE(s_init3, "decoded on the host", Result, h_cv_##tag##init4, void *t, uint64_t bs, uint64_t bs2, uint16_t w, uint16_t h, uint32_t refs, uint32_t in, uint32_t out) { (void)bs; (void)bs2; (void)refs; return cv_dec_init(t, codec, w, h, in, out, NULL, 0); } \
+    HLE_FORCE(s_props2, "the filled buffer's picture size, colour space, time and end of stream", Result, h_cv_##tag##props2, uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch, uint32_t *cs, int64_t *ts, bool *eos, void *t, uint32_t i) { return cv_dec_props_cs(w, h, cw, ch, cs, ts, eos, t, i); }
+CV_SDK19(vp9, CV_VP9, "_ZN2nn5codec20InitializeVp9DecoderEPNS0_14Vp9DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE",
+    "_ZN2nn5codec35GetVp9DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_5movie10ColorSpaceEPNS_8TimeSpanEPbPNS0_14Vp9DecoderTypeEj")
+CV_SDK19(vp8, CV_VP8, "_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE",
+    "_ZN2nn5codec35GetVp8DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_5movie10ColorSpaceEPNS_8TimeSpanEPbPNS0_14Vp8DecoderTypeEj")
+#undef CV_SDK19
+HLE_FORCE("_ZN2nn5codec21InitializeH264DecoderEPNS0_15H264DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatEPKvm", "decoded with VideoToolbox on the host",
+          Result, h_cv_h264init4, void *t, uint64_t bs, uint64_t bs2, uint16_t w, uint16_t h, uint32_t refs, uint32_t in, uint32_t out, const void *csd, uint64_t csd_n) {
+    (void)bs; (void)bs2; (void)refs; return cv_dec_init(t, CV_H264, w, h, in, out, csd, csd_n);
+}
+HLE_FORCE("_ZN2nn5codec36GetH264DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_5movie10ColorSpaceEPNS_8TimeSpanEPbPNS0_15H264DecoderTypeEj", "the filled buffer's picture size, colour space, time and end of stream",
+          Result, h_cv_h264props2, uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch, uint32_t *cs, int64_t *ts, bool *eos, void *t, uint32_t i) { return cv_dec_props_cs(w, h, cw, ch, cs, ts, eos, t, i); }
+HLE_FORCE("_ZN2nn5codec3sdk34MakeDecodeImagePreferenceForCompatEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE", "the preference only carries the size and format to the host's pool",
+          cv_pref, h_cv_pref_compat, uint16_t w, uint16_t h, uint32_t fmt, uint32_t mode) {
+    return (cv_pref){w, h, fmt, mode, CV_MAGIC, {0, 0}};
+}
 HLE_FORCE("_ZN2nn5codec21InitializeH264DecoderEPNS0_15H264DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeEPKvm",
           "decoded with VideoToolbox on the host", Result, h_cv_h264init3, void *t, void *work, uint64_t wsize, uint64_t bs, uint16_t w, uint16_t h, uint32_t refs, uint32_t in, uint32_t out,
           uint32_t mode, const void *csd, uint64_t csd_n) {
