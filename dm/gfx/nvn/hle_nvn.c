@@ -2562,6 +2562,34 @@ int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every pag
     pthread_mutex_unlock(&g_vp_mu); return ok;
 }
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
+// The 64 KB tiles of [a, a + n × 64 KB) in a sparse pool, one pass for a texture's tiles (nvn_mtl.m's Metal sparse textures): st[i] bit 0 its mapping changed after gen or a physical
+// page behind it was written after stamp, bit 1 a page of it is mapped. a is 64 KB aligned in the pool, so a tile lies in one page-table leaf; a leaf never mapped is skipped whole
+void nvn_sparse_tiles(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp, uint8_t *st) {
+    memset(st, 0, n);
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a);
+    if (!v) { pthread_mutex_unlock(&g_vp_mu); return; }
+    uint64_t o0 = a - (uint64_t)(uintptr_t)v->base;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t o = o0 + (i << 16);
+        if (o >= v->size) break;
+        const vpte *l = v->pt[o >> 21];
+        if (!l) { i += ((((o >> 21) + 1) << 21) - o >> 16) - 1; continue; }
+        uint8_t s = 0; const uint8_t *rs = NULL, *re = NULL;
+        for (uint64_t q = o; q < o + 0x10000 && q < v->size; q += 0x1000) {
+            const vpte *e = &l[(q >> 12) & (VPT_LEAF - 1)];
+            if (e->gen > gen) s |= 1;
+            if (!e->phys) continue;
+            s |= 2;
+            if (s & 1) continue;
+            if (rs && e->phys == re) { re += 0x1000; continue; }
+            if (rs && nvn_dirty_since(rs, (size_t)(re - rs), stamp)) s |= 1;
+            rs = e->phys; re = rs + 0x1000;
+        }
+        if (!(s & 1) && rs && nvn_dirty_since(rs, (size_t)(re - rs), stamp)) s |= 1;
+        st[i] = s;
+    }
+    pthread_mutex_unlock(&g_vp_mu);
+}
 NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
     rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, ib, ind});
 }
