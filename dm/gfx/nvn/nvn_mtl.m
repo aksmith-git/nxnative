@@ -2689,10 +2689,11 @@ typedef struct { uint32_t page; uint64_t fence; } msp_late;
 static msp_late *g_msp_late; static size_t g_msp_nlate, g_msp_caplate;   // unmapped pages, free once the GPU has passed their fence
 static uint64_t g_msp_used, g_msp_tiles, g_msp_tails, g_msp_refreshes;
 static int msp_min_mb(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_MSPARSE"); v = e ? MAX(atoi(e), 0) : 32; } return v; }
+static int msp_supported(void) { static int v = -1; if (v < 0) { v = 0; if (@available(macOS 26.4, iOS 26.4, *)) v = g_dev.supportsPlacementSparse; } return v; }
 static int msp_want(const tex_t *t) {
     int mb = msp_min_mb();
     return mb > 0 && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && (t->d.target == NVN_TEXTURE_TARGET_2D || t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY) && t->d.samples <= 1
-        && t->d.levels <= 16 && t->L.size >= ((uint64_t)mb << 20) && !rb_packed_shift(t->d.format) && g_dev.supportsPlacementSparse;
+        && t->d.levels <= 16 && t->L.size >= ((uint64_t)mb << 20) && !rb_packed_shift(t->d.format) && msp_supported();
 }
 static void msp_push_free(uint32_t pg) {
     if (g_msp_nfree == g_msp_capfree) { g_msp_capfree = g_msp_capfree ? 2 * g_msp_capfree : 8192; if (!(g_msp_free = realloc(g_msp_free, g_msp_capfree * sizeof *g_msp_free))) MDIE("sparse texture page list: out of memory"); }
