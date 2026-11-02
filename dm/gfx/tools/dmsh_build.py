@@ -9,7 +9,7 @@
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
 import inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
-import dmsh_geometry, dmsh_atomic, dmsh_abi as abi   # abi: the driver segment layout and the binding kinds the host shares (dm/gfx/nvn/dmsh_abi.h)
+import dmsh_geometry, dmsh_atomic, dmsh_meshstage, dmsh_abi as abi   # abi: the driver segment layout and the binding kinds the host shares (dm/gfx/nvn/dmsh_abi.h)
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HOME = os.path.expanduser('~')
 dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
@@ -214,6 +214,7 @@ def mac_compile(msl, air, lib):   # same interface as ios_metal.compile
 #   c0 base + 0x10 r: storage buffer r (64-bit address, 32-bit size), base C0_SSBO_<stage> (the hull / domain stages' bases were never seen)
 TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SEPTEX_SLOT0, SAMP_BASE = abi.C2_TEX, abi.C2_IMG, abi.C2_IMG_SLOTS, abi.C2_SEPTEX, abi.SEPTEX_SLOT0, abi.C2_SAMP
 SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': abi.C0_SSBO_PS}
+SSBO.update(ts=0x610, ms=0x710)   # task / mesh (NVN2): the tables after the pixel stage's, 0x100 apart as the others (Mario Kart World's grass task shaders read slots 6 and 7 at 0x670 / 0x680)
 
 def records(d):
     r = [m.start() for m in re.finditer(b'BTCDBTCD', d)]
@@ -551,6 +552,16 @@ def job_for(key, name, rec, w):
         # buffer and texture entries (+0xb1, +0xb2, +0xb3) and gives the size (+0xba); the translator maps them to c[24] and NVN's fixed tables (InstEmitAmpere.cs
         # AMapC0). Graphics keeps NVN's tables
         if stage == 'cs': extra['nvn2_cs'] = [rec[ci + 0xb1], rec[ci + 0xb2], rec[ci + 0xb3], struct.unpack_from('<H', rec, ci + 0xba)[0], rec[ci + 0xa9] * 4]
+        if stage in ('ts', 'ms'):
+            # A task / mesh shader (control +0x56 6 / 7): translated as compute, its SPH taken off, its stage memory in shared memory (dmsh_meshstage.py); the control section
+            # gives its workgroup's threads (+0x58), its payload's bytes (+0x5a) and a mesh shader's most vertices and primitives (+0x60, +0x62)
+            ctl = rec[ci:]; sph = code[:0x80]; code = code[0x80:]
+            info = {'kind': stage, 'threads': struct.unpack_from('<H', ctl, 0x58)[0], 'payload': struct.unpack_from('<H', ctl, 0x5a)[0]}
+            if stage == 'ms': info.update(max_v=struct.unpack_from('<H', ctl, 0x60)[0], max_p=struct.unpack_from('<H', ctl, 0x62)[0], comps=dmsh_meshstage.sph_outputs(sph))
+            lay, words = dmsh_meshstage.layout(stage, info.get('max_v', 0), info.get('comps', []), info['payload'])
+            info['mesh_layout'] = lay
+            extra.update(mesh_layout=lay, mesh_stage=info, local=[info['threads'], 1, 1], shared=words * 4)
+            stage = 'cs'
     else:
         c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)   # control segment +0x700: c1 relative to the start of the instruction area, +0x704: total length of the instruction area (c1 = what lies between the two; lengths across the whole library are 0 / 256 / 512 / 768)
         c1 = rec[0x38 + c1o:0x38 + c1t]
@@ -568,6 +579,7 @@ def job_for(key, name, rec, w):
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), **extra,
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
+    if j.get('mesh_stage'): return j, c1   # its threads and memory come from its control section (above)
     if key not in FACTS: j['no_facts'] = True; return j, c1   # not in the answer table: queries use defaults (listed separately in the summary)
     j.update(FACTS[key])
     return j, c1
@@ -1248,6 +1260,9 @@ def finish(key, w, j, c1):
     if j['stage'] == 'cs':
         src, first = first_store(src, j.get('local'))   # the first invocation's store, for the host (see first_store)
         src, tgs = tg_spill(src); open(msl, 'w').write(src)   # threadgroup memory past 32 KB in device memory (see tg_spill)
+        if j.get('mesh_stage'):   # a task / mesh shader: the kernel as the Metal object / mesh function (dmsh_meshstage.py)
+            try: src = dmsh_meshstage.to_stage(src, j['mesh_stage']['kind'], j['mesh_stage']); open(msl, 'w').write(src)
+            except ValueError as e: return 'mesh stage failed', str(e)[:160], None
     pad = []
     if j['stage'] == 'vs':   # outputs start as (0,0,0,1) (see vs_init); no point size beside a layer output (see vs_layer); the base instance from Metal (see vs_base_instance)
         src = vs_base_instance(vs_layer(vs_init(src))); open(msl, 'w').write(src)
@@ -1281,7 +1296,7 @@ def finish(key, w, j, c1):
     clone(msl, os.path.join(out, key + '_b.metal'))
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
-    try: binds = reflect(key, j['stage'], src, res)
+    try: binds = reflect(key, j['mesh_stage']['kind'] if j.get('mesh_stage') else j['stage'], src, res)
     except ValueError as e: return 'reflection failed', str(e)[:160], None
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),
@@ -1290,6 +1305,7 @@ def finish(key, w, j, c1):
             **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}),
             **({'first_store': [{'reg': next(b['reg'] for b in binds if b['msl_name'] == n), 'word': w, 'value': v} for n, w, v in first]} if first else {}),
             **({'tg_spill': True} if tgs else {}),
+            **({'mesh_stage': {k: v for k, v in j['mesh_stage'].items() if k != 'comps'} | {'generics': sorted({n for n, _ in j['mesh_stage'].get('comps', []) if n is not None})}} if j.get('mesh_stage') else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, j['stage']),
             'bindings': binds,
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
