@@ -42,7 +42,9 @@ _Static_assert(DMSH_C2_TEX + DMSH_C2_ROW * DMSH_C2_TEX_SLOTS == DMSH_C2_SEPTEX &
 _Static_assert(DMSH_C0_CS_UBO + DMSH_C0_ROW * DMSH_C0_CS_UBO_SLOTS == DMSH_C0_SSBO_CS && DMSH_C0_SSBO_PS + DMSH_C0_ROW * DMSH_C0_SSBO_SLOTS <= DMSH_C0_POINT_SIZE && DMSH_C0_POINT_SIZE + 4 <= DMSH_C0_SAMPLE_TABLE &&
                DMSH_C0_SAMPLE_TABLE + DMSH_C0_SAMPLE_BYTES <= DMSH_C0_SAMPLE_INFO && DMSH_C0_SAMPLE_INFO + 16 <= DMSH_C0_BASE_INSTANCE && DMSH_C0_BASE_INSTANCE + 4 <= DMSH_DRV_SIZE, "NVN driver c0 tables");
 // Geometry's counter/output addresses are c0+0x410/0x430 (NieR:Automata's MOVC/IADDC pairs); they use the logical NVN stage even when Metal executes a compute kernel.
-static int c0_ssbo_base(int stage) { return stage == 0 ? DMSH_C0_SSBO_VS : stage == 1 ? DMSH_C0_SSBO_PS : stage == 2 ? DMSH_C0_SSBO_GS : stage == 5 ? DMSH_C0_SSBO_CS : -1; }   // NVN stages 0 vertex, 1 pixel, 2 geometry, 5 compute; hull / domain never seen
+// NVN stages 0 vertex, 1 pixel, 2 geometry, 5 compute; 3 / 4 hold NVN2's task and mesh shaders (dmsh_build.py SSBO ts / ms: Mario Kart World's grass task shaders read
+// storage slots 6 and 7 at 0x670 / 0x680); hull / domain never seen
+static int c0_ssbo_base(int stage) { return stage == 0 ? DMSH_C0_SSBO_VS : stage == 1 ? DMSH_C0_SSBO_PS : stage == 2 ? DMSH_C0_SSBO_GS : stage == 5 ? DMSH_C0_SSBO_CS : stage == 3 ? 0x610 : stage == 4 ? 0x710 : -1; }
 // The handle a texture binding of slot reg reads: as c2 holds it (encode_args fills c2 the same way), a combined slot past 31 shares its word with an image slot, and a bound image
 // is what lies there. A texture instruction on an image handle names such a slot: a size query of the image a compute shader writes (Unreal's GetDimensions on a RWTexture3D,
 // dmsh_build.py decode_tex). DRAGON QUEST VII Reimagined's volumetric lightmap indirection patch read the empty texture slot 32 there, got a 1x1 size and wrote only cell (0, 0, 0)
@@ -1692,7 +1694,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[146];
+static int g_red_once[148];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2693,10 +2695,12 @@ static msp_late *g_msp_late; static size_t g_msp_nlate, g_msp_caplate;   // unma
 static uint64_t g_msp_used, g_msp_tiles, g_msp_tails, g_msp_refreshes;
 static int msp_min_mb(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_MSPARSE"); v = e ? MAX(atoi(e), 0) : 32; } return v; }
 static int msp_supported(void) { static int v = -1; if (v < 0) { v = 0; if (@available(macOS 26.4, iOS 26.4, *)) v = g_dev.supportsPlacementSparse; } return v; }
+// Block-compressed formats only: such a texture is never a render target, so tex_upgrade never replaces it by a whole texture (an RGBA8 one drawn into would be)
+static int msp_block_compressed(const tex_t *t) { int bw = 1, bh = 1; nvn_fmt_bpb(t->d.format, &bw, &bh); return bw > 1 || bh > 1; }
 static int msp_want(const tex_t *t) {
     int mb = msp_min_mb();
     return mb > 0 && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && (t->d.target == NVN_TEXTURE_TARGET_2D || t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY) && t->d.samples <= 1
-        && t->d.levels <= 16 && t->L.size >= ((uint64_t)mb << 20) && !rb_packed_shift(t->d.format) && msp_supported();
+        && t->d.levels <= 16 && t->L.size >= ((uint64_t)mb << 20) && !rb_packed_shift(t->d.format) && msp_block_compressed(t) && msp_supported();
 }
 static void msp_push_free(uint32_t pg) {
     if (g_msp_nfree == g_msp_capfree) { g_msp_capfree = g_msp_capfree ? 2 * g_msp_capfree : 8192; if (!(g_msp_free = realloc(g_msp_free, g_msp_capfree * sizeof *g_msp_free))) MDIE("sparse texture page list: out of memory"); }
@@ -2709,7 +2713,7 @@ static uint32_t msp_page_new(void) {   // caller holds g_msp_mu
         MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
         hd.size = (NSUInteger)MSP_HEAP_PAGES * MSP_PAGE; hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
         id<MTLHeap> h = [g_dev newHeapWithDescriptor:hd];
-        if (!h) MDIE("sparse textures: a heap of %u MB could not be made (%llu pages in use)", (unsigned)(MSP_HEAP_PAGES * (MSP_PAGE >> 10) >> 10), (unsigned long long)g_msp_used);
+        if (!h) { RED_ONCE(146, "sparse textures: a heap of %u MB could not be made (%llu pages in use); tiles stay unmapped (read as 0)", (unsigned)(MSP_HEAP_PAGES * (MSP_PAGE >> 10) >> 10), (unsigned long long)g_msp_used); return ~0u; }
         res_add(h);
         if (!g_msp_heaps) g_msp_heaps = [NSMutableArray array];
         uint32_t hi = (uint32_t)g_msp_heaps.count; [g_msp_heaps addObject:h];
@@ -2779,6 +2783,8 @@ static id<MTLTexture> msp_new(NvPkg *pk, const tex_t *t) {
     d.usage |= MTLTextureUsagePixelFormatView;   // a view of another format would otherwise upgrade it (tex_upgrade), a whole texture
     id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
     if (!mt) { RED_ONCE(143, "sparse texture %ux%ux%u format %#x could not be made as a Metal sparse texture; made whole instead", t->d.width, t->d.height, t->d.depth, t->d.format); return nil; }
+    // Unmapped tiles read as 0 only at sparse tier 2 (as the Switch's do); at tier 1 what they read is undefined
+    if (mt.sparseTextureTier != MTLTextureSparseTier2) { RED_ONCE(147, "sparse textures: tier %d, not 2; made whole instead", (int)mt.sparseTextureTier); return nil; }
     res_add(mt);
     msp_t *m = calloc(1, sizeof *m); if (!m) MDIE("sparse texture: out of memory");
     m->levels = (unsigned)mt.mipmapLevelCount; m->layers = (unsigned)mt.arrayLength;
@@ -2802,8 +2808,8 @@ static id<MTLTexture> msp_new(NvPkg *pk, const tex_t *t) {
     pthread_mutex_lock(&g_msp_mu);
     for (unsigned y = 0; y < m->layers; y++) {
         for (unsigned l = m->nt; l < ft; l++) { uint32_t ax = (MAX(t->d.width >> l, 1u) + tw - 1) / tw, ay = (MAX(t->d.height >> l, 1u) + th - 1) / th;
-            for (uint32_t i = 0; i < ax * ay; i++) { uint32_t pg = msp_page_new(); m->fixed[m->nfixed++] = pg; msp_op_add(1, pg, i % ax, i / ax, l, y); } }
-        for (uint32_t k = 0; k < tail_tiles; k++) { uint32_t pg = msp_page_new(); m->fixed[m->nfixed++] = pg; msp_op_add(1, pg, k, 0, ft, y); }
+            for (uint32_t i = 0; i < ax * ay; i++) { uint32_t pg = msp_page_new(); if (pg != ~0u) { m->fixed[m->nfixed++] = pg; msp_op_add(1, pg, i % ax, i / ax, l, y); } } }
+        for (uint32_t k = 0; k < tail_tiles; k++) { uint32_t pg = msp_page_new(); if (pg != ~0u) { m->fixed[m->nfixed++] = pg; msp_op_add(1, pg, k, 0, ft, y); } }
     }
     pthread_mutex_unlock(&g_msp_mu);
     msp_ops_issue(mt);
@@ -2830,7 +2836,7 @@ static void msp_refresh(NvPkg *pk, const tex_t *t, int all) {
                 if (all) f = (f & 2) ? 3 : m->page[k] ? 1 : 0;
                 if (!(f & 1)) continue;
                 if (f & 2) {
-                    if (!m->page[k]) { pthread_mutex_lock(&g_msp_mu); uint32_t pg = msp_page_new(); pthread_mutex_unlock(&g_msp_mu); m->page[k] = pg + 1; msp_op_add(1, pg, i % m->tx[l], i / m->tx[l], l, y); }
+                    if (!m->page[k]) { pthread_mutex_lock(&g_msp_mu); uint32_t pg = msp_page_new(); pthread_mutex_unlock(&g_msp_mu); if (pg != ~0u) { m->page[k] = pg + 1; msp_op_add(1, pg, i % m->tx[l], i / m->tx[l], l, y); } }
                     if (ntodo == ctodo) { ctodo = ctodo ? 2 * ctodo : 1024; if (!(todo = realloc(todo, ctodo * sizeof *todo))) MDIE("sparse texture: out of memory"); }
                     todo[ntodo++] = k;
                 } else if (m->page[k]) {
@@ -5324,9 +5330,11 @@ static void udc_note_draw(NvProg *pr, uint32_t raster_mask) {
 // Metroid Dread's depth prepass calls BindProgram(program, vertex | fragment), then BindProgram(null, fragment): only the vertex shader remains and depth is drawn.
 // Every bind used to replace S.prog as a whole, a null program meant "no program bound", and the prepass's ~140 draws per frame were all dropped: depth stayed empty, the G-buffer's depth EQUAL test passed no pixel, and scenes and characters were black.
 // When every stage comes from the same program, that program is the effective one (all of Mario's and Engage's binds are like this, so nothing changes for them); otherwise a composite is made: a host-made prog_t carrying only a serial, whose NvProg in the serial table takes each stage from its source program (a null fragment = a vertex-only pipeline)
+// NVN2's task and mesh bits (0x40, 0x80) bind stages 3 and 4, where their shaders are kept (the bind calls' st_host, nvn_geometry.inc mesh_tasks_draw)
+static inline int gfx_stage_bits(int stages) { return (stages & 0x1f) | (stages & 0x40 ? 0x08 : 0) | (stages & 0x80 ? 0x10 : 0); }
 static const prog_t *bind_stages(const prog_t *p, int stages) {
     for (int st = 0; st < 5; st++) if (stages >> st & 1) S.bst[st] = p;
-    const prog_t *v = S.bst[0];
+    const prog_t *v = S.bst[0] ? S.bst[0] : S.bst[4];   // a mesh program has no vertex stage
     if (!v) return NULL;
     int same = 1; for (int st = 1; st < 5; st++) if (S.bst[st] && S.bst[st] != v) same = 0;
     if (same && S.bst[1] == v) return v;
@@ -7827,12 +7835,12 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                     // gl_PointSize (Super Mario Odyssey's agl point sprites, alPointSpriteShader: gl_PointSize = min(size attribute, c0[0x610])). It is not SetPointSize: the game
                     // sets that to 1 and sizes its sprites itself (the fog splats ask for 3-18 px). Left at 0, every sprite had size 0, so the splats that push the Cap Kingdom
                     // fog aside never reached its velocity fields and the fog did not part around Mario. 2047 is Maxwell's point size limit (Metal clamps to its own)
-                    if (nvn_stage != 5) { const float max_point = 2047.0f; memcpy(d + DMSH_C0_POINT_SIZE, &max_point, 4); }
+                    if (nvn_stage < 3) { const float max_point = 2047.0f; memcpy(d + DMSH_C0_POINT_SIZE, &max_point, 4); }   // not task / mesh: their storage tables lie there
                     // Graphics stages: 0x644 holds the draw's base instance. Maxwell's instance ID leaves it out (GL's gl_InstanceID), and GLSLC adds this word where a shader needs the
                     // absolute instance (gl_InstanceID + gl_BaseInstance): Pokémon Legends: Z-A's occlusion boxes (a793f436dcabd350, one box per draw at base instance 61, 62, …) pick their
                     // transform this way, and 1,550 reads in 793 of its vertex shaders. Left at 0, every box was box 0: all six queries came back empty, and the game, taking its characters for
                     // hidden, posed their legs straight back from the hips. 0x640 (read by 58 shaders, added to the vertex ID) stays 0: what the driver puts there is not established
-                    if (nvn_stage != 5) memcpy(d + DMSH_C0_BASE_INSTANCE, &g_draw_binst, 4);
+                    if (nvn_stage < 3) memcpy(d + DMSH_C0_BASE_INSTANCE, &g_draw_binst, 4);
                     if (nvn_stage == 1) c0_sample_rows(d, g_pass.samples);
                     if (nvn_stage == 5) {
                         memcpy(d + DMSH_C0_DISPATCH, g_dispatch_dim, 12); g_c0_dim_buf = db; g_c0_dim_off = doff + DMSH_C0_DISPATCH;
@@ -8107,7 +8115,7 @@ static int state_op(uint32_t op, const void *a) {
         // dropped, and a dispatch after a graphics bind found no compute shader. Hyrule Warriors: Age of Calamity interleaves them; its movie's NV12 → RGB draw was dropped and the intro played black
         case OP_BIND_PROGRAM: { const p_bind_program *bp_ = a;
             if ((bp_->stages & 0x20) && bp_->prog != S.cprog) { S.cprog = bp_->prog; args_dirty_all(); }
-            if (bp_->stages & 0x1f) { const prog_t *np = bind_stages(bp_->prog, bp_->stages & 0x1f); if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_dirty_all(); } }
+            if (gfx_stage_bits(bp_->stages)) { const prog_t *np = bind_stages(bp_->prog, gfx_stage_bits(bp_->stages)); if (np != S.prog) { S.prog = np; g_pso_dirty = 1; args_dirty_all(); } }
             break; }
         case OP_BIND_STATE: {
             const p_bind_state *b = a; void *dst = NULL; size_t n = 0;
@@ -8544,7 +8552,7 @@ static void sdx_walk(const uint8_t *p, int depth) {
             case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_IMG: { p_bind_handles t1; const p_bind_handles *b = bind_rec(h.op, a, &t1); bh_fresh(b); int base = h.op == OP_BIND_IMG ? NTEX : 0, lim = h.op == OP_BIND_IMG ? 32 : NTEX;
                 if (b->stage < 6 && b->first >= 0 && b->first + b->n <= lim) for (int k = 0; k < b->n; k++) g_pp_slot[b->stage][base + b->first + k] = h_ser(b->h[k]);
                 break; }
-            case OP_BIND_PROGRAM: { const p_bind_program *bp_ = a; if (bp_->stages & 0x20) g_pp_cprog = bp_->prog; if (bp_->stages & 0x1f) g_pp_prog = bp_->prog; break; }
+            case OP_BIND_PROGRAM: { const p_bind_program *bp_ = a; if (bp_->stages & 0x20) g_pp_cprog = bp_->prog; if (gfx_stage_bits(bp_->stages)) g_pp_prog = bp_->prog; break; }
             case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: {
                 if (h.op != OP_DISPATCH) seq_push(&g_drx_seq, &g_drx_n, &g_drx_cap, seq);
                 const prog_t *pp = h.op == OP_DISPATCH ? g_pp_cprog : g_pp_prog; __unsafe_unretained NvProg *pr = pp ? prog_get(pp) : nil;
