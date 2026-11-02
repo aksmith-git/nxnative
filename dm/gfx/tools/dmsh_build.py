@@ -87,6 +87,36 @@ def first_store(msl, local):
     if len(stores) > 4: return msl, []
     body = msl[m.start():m.end()]
     return msl[:m.start()] + body[:body.rindex('if (!')] + msl[m.end():], stores
+# Threadgroup memory past Metal's 32 KB (Apple GPUs; Ampere gives a workgroup up to 48 KB, more on request) goes to device memory: each threadgroup takes a slot of the host's
+# buffer at TGS_SLOT (nvn_mtl.m tgs_buf, TGS_BYTES), its linear index in the grid modulo the slots that fit, and the barriers also order device memory. Mario Kart World's 168
+# compute shaders of one 48 KB array (threadgroup spvUnsafeArray<uint, 12288>) failed pipeline creation, 15,221 dispatches in its first 5,100 frames, and its title screen came out
+# overexposed in rainbow bands; Pokémon Pokopia has 112 of 35-48 KB. Slots reused while an earlier threadgroup still runs would need more threadgroups in flight than the slots
+# (1,365 of 48 KB; an M4 Pro keeps a few hundred of 64 threads). Only plain element accesses are rewritten: a shader that takes the array's address or runs atomics on it keeps it
+TG_LIMIT, TGS_SLOT, TGS_BYTES = 32768, 30, 64 << 20
+_TG_ELEM = {'uint': 4, 'int': 4, 'float': 4, 'half': 2, 'ushort': 2, 'short': 2, 'uint2': 8, 'int2': 8, 'float2': 8, 'uint4': 16, 'int4': 16, 'float4': 16}
+def tg_spill(msl):
+    decls = list(re.finditer(r'^(\s*)threadgroup spvUnsafeArray<(\w+), (\d+)> (\w+);\n', msl, re.M))
+    if not decls or any(d.group(2) not in _TG_ELEM for d in decls): return msl, False
+    size = sum(_TG_ELEM[d.group(2)] * int(d.group(3)) for d in decls)
+    if size <= TG_LIMIT: return msl, False
+    for d in decls:
+        nm = re.escape(d.group(4))
+        if re.search(r'&\s*%s\b|\b%s\s*\.|\(threadgroup atomic' % (nm, nm), msl) or re.search(r'\b%s\b(?!\s*\[)' % nm, msl[d.end():]):
+            return msl, False
+    k = re.search(r'\bkernel\s+void\s+main0\s*\(((?:[^()]|\([^()]*\))*)\)\s*\{', msl)
+    if not k: return msl, False
+    params = k.group(1); slot = (size + 255) & ~255
+    tgid = re.search(r'uint3 (\w+) \[\[threadgroup_position_in_grid\]\]', params)
+    extra = f', device uchar* dm_tgs [[buffer({TGS_SLOT})]], uint3 dm_tgn [[threadgroups_per_grid]]' + ('' if tgid else ', uint3 dm_tgid [[threadgroup_position_in_grid]]')
+    g = tgid.group(1) if tgid else 'dm_tgid'
+    head = (f'\n    device uchar* dm_tg = dm_tgs + ((({g}.z * dm_tgn.y + {g}.y) * dm_tgn.x + {g}.x) % {TGS_BYTES // slot}u) * {slot}u;   // this threadgroup\'s slot (tg_spill)')
+    out = msl[:k.start(1)] + params + extra + msl[k.end(1):k.end()] + head + msl[k.end():]
+    off = 0
+    for d in decls:
+        out = out.replace(d.group(0), f'{d.group(1)}device {d.group(2)}* {d.group(4)} = (device {d.group(2)}*)(dm_tg + {off});\n', 1)
+        off += (_TG_ELEM[d.group(2)] * int(d.group(3)) + 15) & ~15
+    out = out.replace('threadgroup_barrier(mem_flags::mem_threadgroup)', 'threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup)')
+    return out, True
 def hmma_msl(msl):
     m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
     if not m: return msl
@@ -1213,9 +1243,10 @@ def finish(key, w, j, c1):
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
     src = border_emu(src); open(msl, 'w').write(src)   # border colours Metal lacks (see border_emu)
-    first = []
+    first = []; tgs = False
     if j['stage'] == 'cs':
-        src, first = first_store(src, j.get('local')); open(msl, 'w').write(src)   # the first invocation's store, for the host (see first_store)
+        src, first = first_store(src, j.get('local'))   # the first invocation's store, for the host (see first_store)
+        src, tgs = tg_spill(src); open(msl, 'w').write(src)   # threadgroup memory past 32 KB in device memory (see tg_spill)
     pad = []
     if j['stage'] == 'vs':   # outputs start as (0,0,0,1) (see vs_init); no point size beside a layer output (see vs_layer); the base instance from Metal (see vs_base_instance)
         src = vs_base_instance(vs_layer(vs_init(src))); open(msl, 'w').write(src)
@@ -1257,6 +1288,7 @@ def finish(key, w, j, c1):
             **({'entry_tf': 'main0_tf', 'tf_strides': [e['stride'] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
             **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}),
             **({'first_store': [{'reg': next(b['reg'] for b in binds if b['msl_name'] == n), 'word': w, 'value': v} for n, w, v in first]} if first else {}),
+            **({'tg_spill': True} if tgs else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, j['stage']),
             'bindings': binds,
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],

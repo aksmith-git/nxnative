@@ -7403,6 +7403,13 @@ static void bind_args(id<MTLCommandEncoder> en, int nvn_stage, int metal_vertex,
     if (nvn_stage == 5 || nvn_stage == 2) enc_c_args((id<MTLComputeCommandEncoder>)en, gpu, ai);
     else enc_r_args((id<MTLRenderCommandEncoder>)en, metal_vertex ? MTLRenderStageVertex : MTLRenderStageFragment, gpu, ai);
 }
+// Device memory for the threadgroup memory of compute shaders past Metal's 32 KB (dmsh_build.py tg_spill, TGS_BYTES): each threadgroup takes a slot by its index in the grid. Made at the first such dispatch
+static id<MTLBuffer> tgs_buf(void) {
+    static __strong id<MTLBuffer> b; if (b) return b;
+    b = [g_dev newBufferWithLength:64u << 20 options:MTLResourceStorageModePrivate]; if (!b) MDIE("failed to create the threadgroup spill buffer"); res_add(b);
+    MLOG("threadgroup memory past 32 KB: a 64 MB device buffer holds it (first shader that needs it)");
+    return b;
+}
 // Static constant buffers of route B: the Ryujinx support_buffer (layout in Ryujinx.Graphics.Shader/SupportBuffer.cs: alpha_test u32, is_bgra u32[8],
 // viewport_inverse f4, viewport_size f4, frag_scale_count i32, render_scale f32[73]..., each field aligned to 16 bytes) and the all-0 driver constant segment (64 KB = the upper bound declared by shaders)
 static id<MTLBuffer> support_buf(void) {
@@ -10523,6 +10530,7 @@ static void dispatch(const p_dispatch *dp) {
     g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
     g_c0_dim_buf = nil;
     encode_args(ce, cs, 5, 0);
+    if (cs->rf.tg_spill) enc_c_args(ce, tgs_buf().gpuAddress, 30);   // its threadgroup memory past 32 KB (dmsh_build.py tg_spill)
     if (dp->ind) {   // The shader reads the group counts from c0 + 0x200: copy the GPU-written ones there first (Metal 4 orders nothing inside an encoder without a barrier)
         if (g_c0_dim_buf) { [(id<MTL4ComputeCommandEncoder>)ce copyFromBuffer:(__bridge id<MTLBuffer>)ib sourceOffset:io toBuffer:g_c0_dim_buf destinationOffset:g_c0_dim_off size:12];
             [(id<MTL4ComputeCommandEncoder>)ce barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch visibilityOptions:resource_vis()]; }
