@@ -557,8 +557,11 @@ def job_for(key, name, rec, w):
             # gives its workgroup's threads (+0x58), its payload's bytes (+0x5a) and a mesh shader's most vertices and primitives (+0x60, +0x62)
             ctl = rec[ci:]; sph = code[:0x80]; code = code[0x80:]
             info = {'kind': stage, 'threads': struct.unpack_from('<H', ctl, 0x58)[0], 'payload': struct.unpack_from('<H', ctl, 0x5a)[0]}
-            if stage == 'ms': info.update(max_v=struct.unpack_from('<H', ctl, 0x60)[0], max_p=struct.unpack_from('<H', ctl, 0x62)[0], comps=dmsh_meshstage.sph_outputs(sph))
-            lay, words = dmsh_meshstage.layout(stage, info.get('max_v', 0), info.get('comps', []), info['payload'])
+            if stage == 'ms':
+                psph = dmsh_meshstage.prim_sph(ctl, rec[0x38:ci])   # after the instructions: the whole code area
+                info.update(max_v=struct.unpack_from('<H', ctl, 0x60)[0], max_p=struct.unpack_from('<H', ctl, 0x62)[0], comps=dmsh_meshstage.sph_outputs(sph), task=bool(ctl[0x5e]),
+                            pcomps=[(n, c) for n, c in dmsh_meshstage.sph_outputs(psph) if n is not None] if psph else [])
+            lay, words = dmsh_meshstage.layout(stage, info.get('max_v', 0), info.get('comps', []), info['payload'], info.get('max_p', 0), info.get('pcomps', []))
             info['mesh_layout'] = lay
             extra.update(mesh_layout=lay, mesh_stage=info, local=[info['threads'], 1, 1], shared=words * 4)
             stage = 'cs'
@@ -1305,7 +1308,7 @@ def finish(key, w, j, c1):
             **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}),
             **({'first_store': [{'reg': next(b['reg'] for b in binds if b['msl_name'] == n), 'word': w, 'value': v} for n, w, v in first]} if first else {}),
             **({'tg_spill': True} if tgs else {}),
-            **({'mesh_stage': {k: v for k, v in j['mesh_stage'].items() if k != 'comps'} | {'generics': sorted({n for n, _ in j['mesh_stage'].get('comps', []) if n is not None})}} if j.get('mesh_stage') else {}),
+            **({'mesh_stage': {k: v for k, v in j['mesh_stage'].items() if k not in ('comps', 'pcomps')} | {'generics': sorted({n for n, _ in j['mesh_stage'].get('comps', []) if n is not None}), 'prim_generics': sorted({n for n, _ in j['mesh_stage'].get('pcomps', [])})}} if j.get('mesh_stage') else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, j['stage']),
             'bindings': binds,
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],

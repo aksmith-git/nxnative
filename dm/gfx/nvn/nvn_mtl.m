@@ -1692,7 +1692,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[142];
+static int g_red_once[146];
 #define RED_ONCE(k, ...) do { if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -2772,13 +2772,13 @@ static id<MTLTexture> msp_new(NvPkg *pk, const tex_t *t) {
     if (nvn_nt <= 0 || td != 1) return nil;
     MTLSize ts = [g_dev sparseTileSizeWithTextureType:d.textureType pixelFormat:d.pixelFormat sampleCount:1 sparsePageSize:MTLSparsePageSize64];
     if (ts.width != tw || ts.height != th || ts.depth != 1) {
-        RED_ONCE(160, "sparse texture format %#x: Metal's 64 KB tile is %lux%lu, NVN's %ux%u; made whole instead (first case ser=%llu)", t->d.format, (unsigned long)ts.width, (unsigned long)ts.height, tw, th, (unsigned long long)t->serial);
+        RED_ONCE(142, "sparse texture format %#x: Metal's 64 KB tile is %lux%lu, NVN's %ux%u; made whole instead (first case ser=%llu)", t->d.format, (unsigned long)ts.width, (unsigned long)ts.height, tw, th, (unsigned long long)t->serial);
         return nil;
     }
     d.storageMode = MTLStorageModePrivate; d.placementSparsePageSize = MTLSparsePageSize64;
     d.usage |= MTLTextureUsagePixelFormatView;   // a view of another format would otherwise upgrade it (tex_upgrade), a whole texture
     id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
-    if (!mt) { RED_ONCE(161, "sparse texture %ux%ux%u format %#x could not be made as a Metal sparse texture; made whole instead", t->d.width, t->d.height, t->d.depth, t->d.format); return nil; }
+    if (!mt) { RED_ONCE(143, "sparse texture %ux%ux%u format %#x could not be made as a Metal sparse texture; made whole instead", t->d.width, t->d.height, t->d.depth, t->d.format); return nil; }
     res_add(mt);
     msp_t *m = calloc(1, sizeof *m); if (!m) MDIE("sparse texture: out of memory");
     m->levels = (unsigned)mt.mipmapLevelCount; m->layers = (unsigned)mt.arrayLength;
@@ -2874,7 +2874,7 @@ static void msp_refresh(NvPkg *pk, const tex_t *t, int all) {
             for (unsigned l = m->nt; l < m->levels; l++) {
                 uint32_t lw = MAX(t->d.width >> l, 1u), lh = MAX(t->d.height >> l, 1u), rb = (lw + m->bw - 1) / m->bw * m->bpb, rows = (lh + m->bh - 1) / m->bh;
                 id<MTLBuffer> b; size_t off; uint8_t *dst = msp_stage((size_t)rb * rows, &b, &off);
-                if (nvn_deswizzle_part(&t->d, l, y, part, from, dst, rb)) { RED_ONCE(162, "sparse texture tail: deswizzle failed format %#x level %u", t->d.format, l); continue; }
+                if (nvn_deswizzle_part(&t->d, l, y, part, from, dst, rb)) { RED_ONCE(144, "sparse texture tail: deswizzle failed format %#x level %u", t->d.format, l); continue; }
                 up_blit_add_at(b, off, rb, (size_t)rb * rows, MTLSizeMake(lw, lh, 1), mt, y, l, MTLOriginMake(0, 0, 0));
             }
             free(part);
@@ -4059,7 +4059,7 @@ static void shmap_read(void) {
     MLOG("shader route B (translated Switch originals): shader map %lu entries (%s), metallib directory %s", (unsigned long)g_shmap.count, path.UTF8String, g_msl_dir.UTF8String);
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; uint8_t mask_m, mesh_kind; uint16_t mesh_threads, mesh_payload;   // mesh_kind: 1 a task shader, 2 a mesh shader (dmsh_meshstage.py), its workgroup's threads and payload bytes
+@interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; uint8_t mask_m, mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // mesh_kind: 1 a task shader, 2 a mesh shader (dmsh_meshstage.py), its workgroup's threads and payload bytes
       // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
@@ -4312,7 +4312,8 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
             o->geo_words = (uint32_t)reads.count;
         } }
     o->fn = fn4_note([lib newFunctionWithName:entry], lib, entry, nil); o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key); o->ventry = entry;
-    if (mst) { o->mesh_kind = [mst[@"kind"] isEqual:@"ts"] ? 1 : 2; o->mesh_threads = (uint16_t)[mst[@"threads"] unsignedIntValue]; o->mesh_payload = (uint16_t)[mst[@"payload"] unsignedIntValue]; }
+    if (mst) { o->mesh_kind = [mst[@"kind"] isEqual:@"ts"] ? 1 : 2; o->mesh_threads = (uint16_t)[mst[@"threads"] unsignedIntValue]; o->mesh_payload = (uint16_t)[mst[@"payload"] unsignedIntValue];
+               o->mesh_notask = o->mesh_kind == 2 && mst[@"task"] && ![mst[@"task"] boolValue]; }   // a mesh shader with no task stage
     // writes the layer (render_target_array_index, named in the library's metadata): its passes are layered and its pipelines get an input class (pso_desc). A library with layer entry points
     // names it for those alone: its main0 / main0_z write no layer
     if (stage == 0) o->layer_out = layer || (t_lib_layer && !j[@"entry_layer"]);

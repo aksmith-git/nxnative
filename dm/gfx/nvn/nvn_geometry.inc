@@ -482,20 +482,19 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *pr) {
     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = pr->sh[1];
     pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
     memset(k.attr, 0, sizeof k.attr); memset(k.stream, 0, sizeof k.stream);
-    k.fsfn = (__bridge void *)ts->fn;
+    k.fsfn = ts ? (__bridge void *)ts->fn : (__bridge void *)ms->fn;
     os_unfair_lock_lock(&g_pso_mtk_lock); id ps = hm_get_id(&g_pso_mtk, &k);
     if (!ps) { if (!g_pso_mesh_building) g_pso_mesh_building = [NSObject new]; hm_put_id(&g_pso_mtk, &k, g_pso_mesh_building); }
     os_unfair_lock_unlock(&g_pso_mtk_lock);
     if (!ps) {
         MTLRenderPipelineDescriptor *d = pso_desc(&k, ms, fs, nil, 0);
         MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
-        m.objectFunction = ts->fn; m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction;
-        m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u;
-        m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+        m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+        if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
         m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
         for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
         m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
-        const char *tk = ts->key, *mk = ms->key, *fk = fs ? fs->key : "-"; pso_key kk = k;
+        const char *tk = ts ? ts->key : "-", *mk = ms->key, *fk = fs ? fs->key : "-"; pso_key kk = k;
         dispatch_async(pp_bg_queue(), ^{
             NSError *e = nil; uint64_t t0 = bp_now();
             id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
@@ -509,19 +508,21 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *pr) {
 static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_;
     [en setArgumentTable:g_ot atStages:MTLRenderStageObject]; [en setArgumentTable:g_mt atStages:MTLRenderStageMesh];
-    g_args_tab = g_ot; g_args_dirty[3] = 1; encode_args(en, g_mtk.ts, 3, 0);
+    if (g_mtk.ts) { g_args_tab = g_ot; g_args_dirty[3] = 1; encode_args(en, g_mtk.ts, 3, 0); }
     g_args_tab = g_mt; g_args_dirty[4] = 1; encode_args(en, g_mtk.ms, 4, 0);
     g_args_tab = nil; g_args_dirty[3] = g_args_dirty[4] = 1;
-    id<MTLBuffer> b; size_t o = arena_alloc(16, &b); memcpy((uint8_t *)b.contents + o, &g_mtk.first, 4);
-    if (rec_on()) rec_table_op(RO_T_ADDR, g_ot, b.gpuAddress + o, 29); else [g_ot setAddress:b.gpuAddress + o atIndex:29];
-    [en drawMeshThreadgroups:MTLSizeMake(g_mtk.count, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(g_mtk.ts->mesh_threads, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(g_mtk.ms->mesh_threads, 1, 1)];
+    id<MTLBuffer> b; size_t o = arena_alloc(16, &b); memcpy((uint8_t *)b.contents + o, &g_mtk.first, 4);   // the draw's first group, buffer 29 of both stages
+    if (rec_on()) { rec_table_op(RO_T_ADDR, g_ot, b.gpuAddress + o, 29); rec_table_op(RO_T_ADDR, g_mt, b.gpuAddress + o, 29); }
+    else { [g_ot setAddress:b.gpuAddress + o atIndex:29]; [g_mt setAddress:b.gpuAddress + o atIndex:29]; }
+    [en drawMeshThreadgroups:MTLSizeMake(g_mtk.count, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(g_mtk.ts ? g_mtk.ts->mesh_threads : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(g_mtk.ms->mesh_threads, 1, 1)];
 }
 static void mesh_tasks_draw(const p_draw *dw) {
     if (!S.prog || dw->count <= 0) return;
     NvProg *pr = prog_get(S.prog);
     NvShader *ts = pr ? pr->sh[3] : nil, *ms = pr ? pr->sh[4] : nil;
-    if (!ts || !ms || ts->mesh_kind != 1 || ms->mesh_kind != 2 || !ts->fn || !ms->fn) {
-        RED_ONCE(170, "DrawMeshTasks with a program without a task and a mesh shader (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
+    if (ts && ts->mesh_kind != 1) ts = nil;   // a mesh shader with no task stage draws its groups itself (mesh_notask)
+    if (!ms || ms->mesh_kind != 2 || !ms->fn || (!ts && !ms->mesh_notask) || (ts && !ts->fn)) {
+        RED_ONCE(145, "DrawMeshTasks with a program without a task and a mesh shader (task %s mesh %s): draw skipped", ts ? ts->key : "-", ms ? ms->key : "-"); return; }
     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone (draw() binds its arguments; mtk_encode the task and mesh stages')
     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
@@ -531,7 +532,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
     swrite_note(pr); g_wr_epoch++;
-    if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u task workgroups", ts->key, ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count);
+    if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u task workgroups", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count);
 }
 typedef struct {
     const uint8_t *op;

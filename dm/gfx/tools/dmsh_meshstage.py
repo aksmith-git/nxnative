@@ -18,6 +18,14 @@ import re
 LAYOUT = (0, 0x40, 0x900)   # byte offsets in the shared array: the workgroup's number, the stage input (payload), the outputs; the primitive bytes follow the outputs
 
 
+def prim_sph(ctl, code):
+    """A mesh shader's per-primitive outputs: a second SPH after its instructions, at the code area offset the control section gives at +0x64 when +0x68 bit 7 is set
+    (its OMAP: generic attributes only). Mario Kart World's grass: ddc034e8e009ebfc's (generic 0 .x) is the flat locn0 its pixel shader 3cc3501255bb2d74 reads"""
+    if len(ctl) < 0x6c or not ctl[0x68] & 0x80: return None
+    o = int.from_bytes(ctl[0x64:0x68], 'little')
+    return code[o:o + 0x80] if 0 < o and o + 0x80 <= len(code) else None
+
+
 def sph_outputs(sph):
     """The SoA components a mesh shader writes, in order: [(None, c)] for the position's, [(n, c)] for generic attribute n's"""
     out = [(None, c) for c in range(4) if sph[0x35] >> (4 + c) & 1]
@@ -27,14 +35,14 @@ def sph_outputs(sph):
     return out
 
 
-def layout(kind, max_v, comps, payload):
-    """(mesh_layout for the translator, shared array words): the outputs hold a task's payload, or a mesh shader's attribute blocks with room for as many
-    primitive attribute words again; the primitive bytes follow"""
+def layout(kind, max_v, comps, payload, max_p=0, pcomps=()):
+    """(mesh_layout for the translator, shared array words): the outputs hold a task's payload, or a mesh shader's attribute blocks (32 vertices and 32 primitives
+    a block: its vertex components, then its primitive components, 0x80 bytes each); the primitive bytes follow"""
     sys_, isbe, out = LAYOUT
     if kind == 'ts': return [sys_, isbe, out, out + payload], (out + payload + 0xf) // 4 + 4
-    blocks = (max_v + 31) // 32
-    prim = out + 2 * blocks * max(len(comps), 1) * 0x80
-    return [sys_, isbe, out, prim], (prim + 4 + 3 * 256 + 0xf) // 4 + 4
+    blocks = max((max_v + 31) // 32, (max_p + 31) // 32, 1)
+    prim = out + blocks * max(len(comps) + len(pcomps), 1) * 0x80
+    return [sys_, isbe, out, prim], (prim + 4 + 3 * max(max_p, 1) + 0xf) // 4 + 4
 
 
 _ENTRY = re.compile(r'kernel\s+void\s+main0\s*\(((?:[^()]|\([^()]*\))*)\)\s*\{\s*threadgroup\s+spvUnsafeArray<uint,\s*(\d+)>\s+(\w+);\n')
@@ -75,28 +83,41 @@ def to_stage(msl, kind, info):
             f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n'
             f'    for (uint i = dm_lid; i < {payw}u; i += {thr}u) dm_pl.w[i] = {arr}[{out_w}u + i];\n'
             f'    if (dm_lid == 0u) dm_mgp.set_threadgroups_per_grid(uint3(min({arr}[{out_w + 1}], 1024u), 1u, 1u));\n}}\n')
-    comps, max_v, max_p = info['comps'], info['max_v'], info['max_p']
-    gens = sorted({n for n, _ in comps if n is not None})
-    nc = max(len(comps), 1)
+    comps, max_v, max_p, pcomps = info['comps'], info['max_v'], info['max_p'], [tuple(c) for c in info.get('pcomps', [])]
+    gens = sorted({n for n, _ in comps if n is not None}); pgens = sorted({n for n, _ in pcomps})
+    stride = max(len(comps) + len(pcomps), 1) * 32   # words a block of 32 vertices and 32 primitives
     sets = ''
     for n in [None] + gens:
         lanes = [f'as_type<float>({arr}[b + {comps.index((n, c)) * 32}u])' if (n, c) in comps else ('1.0' if c == 3 else '0.0') for c in range(4)]
         sets += f'        o.{"position" if n is None else f"a{n}"} = float4({", ".join(lanes)});\n'
-    head += ('struct dm_vertex_t {\n    float4 position [[position]];\n' + ''.join(f'    float4 a{n} [[user(locn{n})]];\n' for n in gens) + '};\n'
-             f'using dm_mesh_t = metal::mesh<dm_vertex_t, void, {max_v}, {max_p}, metal::topology::triangle>;\n')
+    psets = ''
+    for n in pgens:
+        lanes = [f'as_type<float>({arr}[b + {(len(comps) + pcomps.index((n, c))) * 32}u])' if (n, c) in pcomps else ('1.0' if c == 3 else '0.0') for c in range(4)]
+        psets += f'        q.p{n} = float4({", ".join(lanes)});\n'
+    head += ('struct dm_vertex_t {\n    float4 position [[position]];\n' + ''.join(f'    float4 a{n} [[user(locn{n})]];\n' for n in gens) + '};\n' +
+             ('struct dm_prim_t {\n' + ''.join(f'    float4 p{n} [[user(locn{n})]];\n' for n in pgens) + '};\n' if pgens else '') +
+             f'using dm_mesh_t = metal::mesh<dm_vertex_t, {"dm_prim_t" if pgens else "void"}, {max_v}, {max_p}, metal::topology::triangle>;\n')
+
+    task = info.get('task', True)
 
     def entry(name, gl):
-        return (f'[[mesh]] void {name}({", ".join(params)}, dm_mesh_t dm_out, const object_data dm_payload_t& dm_pl [[payload]], '
-                f'uint dm_tg [[threadgroup_position_in_grid]], uint dm_lid [[thread_position_in_threadgroup]])\n{{\n' + start +
-                f'    for (uint i = dm_lid; i < {payw}u; i += {thr}u) {arr}[{isbe_w}u + i] = dm_pl.w[i];\n'
-                f'    if (dm_lid == 0u) {arr}[{sys_w}] = dm_tg;\n'
+        # With a task stage the mesh shader reads its number among the task's launches as payload word 0 (ISBERD mode 0x38 at 0: the task writes from +4), and the
+        # payload from +0x10; with none (control +0x5e clear) it reads its number with mode 0x78, the draw's first group (buffer 29) added
+        return (f'[[mesh]] void {name}({", ".join(params)}, dm_mesh_t dm_out, ' + ('const object_data dm_payload_t& dm_pl [[payload]], ' if task else '') +
+                f'uint dm_tg [[threadgroup_position_in_grid]], uint dm_lid [[thread_position_in_threadgroup]], constant uint* dm_first [[buffer(29)]])\n{{\n' + start +
+                (f'    for (uint i = dm_lid; i < {payw}u; i += {thr}u) {arr}[{isbe_w}u + i] = dm_pl.w[i];\n'
+                 f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n'
+                 f'    if (dm_lid == 0u) {{ {arr}[{sys_w}] = dm_tg; {arr}[{isbe_w}] = dm_tg; }}\n' if task else
+                 f'    if (dm_lid == 0u) {arr}[{sys_w}] = dm_first[0] + dm_tg;\n') +
                 f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n    {call}\n'
                 f'    threadgroup_barrier(mem_flags::mem_threadgroup);\n'
                 f'    uint np = min(({arr}[{prim_b // 4}] >> 24) & 0xffu, {max_p}u);\n'
                 f'    if (dm_lid == 0u) dm_out.set_primitive_count(np);\n'
                 f'    for (uint v = dm_lid; v < {max_v}u; v += {thr}u)\n    {{\n'
-                f'        uint b = {out_w}u + (v / 32u) * {nc * 32}u + (v % 32u);\n        dm_vertex_t o;\n' + sets +
+                f'        uint b = {out_w}u + (v / 32u) * {stride}u + (v % 32u);\n        dm_vertex_t o;\n' + sets +
                 ('        o.position.z = fma(o.position.z, 0.5, o.position.w * 0.5);\n' if gl else '') +
-                f'        dm_out.set_vertex(v, o);\n    }}\n'
+                f'        dm_out.set_vertex(v, o);\n    }}\n' +
+                (f'    for (uint p = dm_lid; p < np; p += {thr}u)\n    {{\n        uint b = {out_w}u + (p / 32u) * {stride}u + (p % 32u);\n        dm_prim_t q;\n' + psets +
+                 f'        dm_out.set_primitive(p, q);\n    }}\n' if pgens else '') +
                 f'    for (uint i = dm_lid; i < np * 3u; i += {thr}u) {{ uint a = {prim_b + 4}u + i; dm_out.set_index(i, ({arr}[a / 4u] >> ((a % 4u) * 8u)) & 0xffu); }}\n}}\n')
     return src + '\n' + head + entry('main0', True) + '\n' + entry('main0_z', False)
