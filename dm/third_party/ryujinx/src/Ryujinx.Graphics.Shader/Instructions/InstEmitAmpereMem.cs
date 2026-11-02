@@ -28,6 +28,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
+            x(0x38c, InstName.Atoms, AAtoms, N);
+            x(0xf8c, InstName.Atoms, AAtoms, N);   // ATOMS.POPC.INC (Pokémon Pokopia's histogram e4ec13f79f9e0bd4)
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
@@ -308,12 +310,40 @@ namespace Ryujinx.Graphics.Shader.Instructions
             ASet(context, x, res);
         }
 
+        // ATOMS Rd, [Ra + UR + offset], Rb (0x38c; Pokémon Pokopia's compute shaders, e.g. ATOMS.ADD R3, [RZ + 0x1000], R0): shared memory, the operation (87..91) and
+        // type (73..76) as ATOMG's, the byte offset at 40..64 and UR at 64 as STS's. Addressed in words, as Maxwell's ATOMS
+        public static void AAtoms(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+
+            if (context.TranslatorContext.Definitions.Stage != ShaderStage.Compute)
+            {
+                throw AFail(context, "ATOMS outside a compute shader");
+            }
+
+            Operand addr = context.IAdd(ALocalAddress(context, x, 64, shared: true), Const((int)x.SignedField(40, 64)));
+            Operand word = context.ShiftRightU32(addr, Const(2));
+            // 0xf8c, ATOMS.POPC.INC: an increment by 1 with no source register (the warp's lanes on one address are summed by the hardware; per lane it is an add of 1)
+            bool inc = x.Opcode == 0xf8c;
+            Operand value = inc ? Const(1) : Register(x.Rb, RegisterType.Gpr);
+            Operand res = EmitAtomicOp(context, StorageKind.SharedMemory, inc ? AtomOp.Add : (AtomOp)x.Bits(87, 91), inc ? AtomSize.U32 : (AtomSize)x.Bits(73, 76), Const(context.ResourceManager.SharedMemoryId), word, value);
+
+            ASet(context, x, res);
+        }
+
         // ---- local and shared memory ----
 
-        // The 32-bit address of a local / shared access: Ra plus the uniform register (at urLo in the uniform form, bit 91)
-        private static Operand ALocalAddress(EmitterContext context, AmpereOp x, int urLo)
+        // The 32-bit address of a local / shared access: Ra plus the uniform register (at urLo in the uniform form, bit 91). A shared access with bit 78 scales Ra by 4
+        // ([Ra.X4 + UR + offset]): Pokémon Pokopia has 1,879 STS, 1,352 LDS and its ATOMS.POPC.INC with it; its 64-bin histogram (e4ec13f79f9e0bd4) increments [R3.X4] with R3 = 0..63
+        // in 256 bytes of shared memory. Read unscaled, those accesses landed on the wrong words. Local accesses never set the bit there
+        private static Operand ALocalAddress(EmitterContext context, AmpereOp x, int urLo, bool shared = false)
         {
             Operand addr = Register(x.Ra, RegisterType.Gpr);
+
+            if (shared && x.Bit(78) && x.Ra != RegisterConsts.RegisterZeroIndex)
+            {
+                addr = context.ShiftLeft(addr, Const(2));
+            }
 
             if (x.Bit(91) && x.Bits(urLo, urLo + 6) != RegisterConsts.UniformZeroIndex)
             {
@@ -329,7 +359,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             AmpereOp x = new(context.CurrOp);
             StorageKind kind = x.Opcode == AmpereOpcodes.Ldl ? StorageKind.LocalMemory : StorageKind.SharedMemory;
 
-            EmitLoad(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 32), x.Rd, (int)x.SignedField(40, 64));
+            EmitLoad(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 32, kind == StorageKind.SharedMemory), x.Rd, (int)x.SignedField(40, 64));
         }
 
         // STL / STS [Ra + UR + offset], Rb: UR at 64
@@ -338,7 +368,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             AmpereOp x = new(context.CurrOp);
             StorageKind kind = x.Opcode is 0x387 or 0x987 ? StorageKind.LocalMemory : StorageKind.SharedMemory;
 
-            EmitStore(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 64), x.Rb, (int)x.SignedField(40, 64));
+            EmitStore(context, kind, (LsSize2)x.Bits(73, 76), ALocalAddress(context, x, 64, kind == StorageKind.SharedMemory), x.Rb, (int)x.SignedField(40, 64));
         }
 
         // ---- surfaces ----
@@ -697,6 +727,18 @@ namespace Ryujinx.Graphics.Shader.Instructions
                         type = SamplerType.TextureBuffer;
                         sources.RemoveAt(sources.Count - 1);
                         flags &= ~TextureFlags.LodLevel;
+                    }
+                    else if (Sample1DAs2D)
+                    {
+                        // nxnative: as Maxwell's TLDS Texture1DLodZero, the bound descriptor decides between a 1D texture and a texture buffer, and with no type answer
+                        // the fetch is 2D at (x & 0x3FFF, x >> 14): a 1D texture (one row on the host) reads (x, 0) as before, and the host binds a texture buffer in
+                        // the slot as 16384-texel rows (nvn_mtl.m tbuf_as_2d). Pokémon Pokopia's KTGL reads its light and decal lists this way (NVN target 10 in slots
+                        // the shaders declare 1D); bound as is, the 1D slot took a buffer view and the GPU faulted
+                        Operand x0 = sources[0];
+                        sources[0] = context.BitwiseAnd(x0, Const(0x3FFF));
+                        sources.Insert(1, context.ShiftRightU32(x0, Const(14)));
+                        context.TranslatorContext.GpuAccessor.RecordTexelFetch1D(handle);
+                        type = SamplerType.Texture2D;
                     }
                 }
             }

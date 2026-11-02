@@ -666,8 +666,11 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     // sections differ only in GLSLC's compile information (+0x778..+0x791, +0x7d0..+0x7e7): it hands a program the section of an earlier shader with the same rest, so the bytes there name another shader
     if (nvn2_ctl(sd->control)) {
         uint8_t ctl[NVN2_KEY_CTL]; memcpy(ctl, sd->control, NVN2_KEY_CTL); memset(ctl + 0x30, 0, 4);
+        // An NVN2 section's shader_key_skip lies in its header (+0x08..+0x2f): Pokémon Pokopia's KTGL rewrites +0x08 and GLSLC's compile hash at +0x20 when it loads a
+        // shader whose code it keeps byte for byte (0x0b → 0x11, a new hash), so its programs name the packaged shader only with those bytes left out
+        if (DM_GAME_SHADER_KEY_SKIP_LEN && DM_GAME_SHADER_KEY_SKIP_OFF + DM_GAME_SHADER_KEY_SKIP_LEN <= 0x30) memset(ctl + DM_GAME_SHADER_KEY_SKIP_OFF, 0, DM_GAME_SHADER_KEY_SKIP_LEN);
         CC_SHA256_Update(&hc, ctl, NVN2_KEY_CTL);
-    } else if (DM_GAME_SHADER_KEY_SKIP_LEN && DM_GAME_SHADER_KEY_SKIP_OFF + DM_GAME_SHADER_KEY_SKIP_LEN <= nctl) {
+    } else if (DM_GAME_SHADER_KEY_SKIP_LEN && DM_GAME_SHADER_KEY_SKIP_OFF >= 0x30 && DM_GAME_SHADER_KEY_SKIP_OFF + DM_GAME_SHADER_KEY_SKIP_LEN <= nctl) {
         uint8_t ctl[0x880]; memcpy(ctl, sd->control, nctl); memset(ctl + DM_GAME_SHADER_KEY_SKIP_OFF, 0, DM_GAME_SHADER_KEY_SKIP_LEN);
         CC_SHA256_Update(&hc, ctl, nctl);
     } else CC_SHA256_Update(&hc, sd->control, nctl);
@@ -2135,6 +2138,9 @@ static void vpool_drop(pool_t *o) {   // caller holds g_vp_mu
 static void vpool_release(pool_t *o) { pthread_mutex_lock(&g_vp_mu); vpool_drop(o); pthread_mutex_unlock(&g_vp_mu); }
 // Mapped runs of a sparse pool: [lo, hi) sorted, disjoint, adjacent runs merged. Caller holds g_vp_mu
 static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
+    // Diagnostic DM_VPOOL_NORUNS=1: sparse pools' runs are not registered with Metal (their textures still read through the page table; buffers in them get no GPU address)
+    static int noruns = -1; if (noruns < 0) { const char *e = getenv("DM_VPOOL_NORUNS"); noruns = e && *e == '1'; if (noruns) LOG("DM_VPOOL_NORUNS: sparse pool runs are not registered with Metal (diagnostic)"); }
+    if (noruns) return;
     uint64_t nl[NVRUN][2]; int nn = 0; uint64_t mlo = lo, mhi = hi;
     for (int k = 0; k < v->nrun; k++) {
         uint64_t a = v->run[k].lo, b = v->run[k].hi;
@@ -2197,6 +2203,9 @@ NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappi
         else o->vmode = 2;
     }
     struct vpool *v = o->vmode == 2 ? vpool_of(o) : NULL; int ok = 1;
+    // Diagnostic DM_VPOOL_LOG=<n>: the first n mapping requests of sparse pools (virtual offset, size, physical pool and offset), to see how a game backs them
+    { static int nlog = -1; if (nlog < 0) { const char *e = getenv("DM_VPOOL_LOG"); nlog = e ? atoi(e) : 0; }
+      for (int i = 0; v && i < n && nlog > 0; i++, nlog--) LOG("[vpool] %p (%#llx) map v=%#llx+%#llx ← %p+%#llx", (void *)o, (unsigned long long)o->size, (unsigned long long)r[i].voff, (unsigned long long)r[i].size, (const void *)r[i].phys, (unsigned long long)r[i].poff); }
     for (int i = 0; v && i < n && ok; i++) ok = vpool_map(v, &r[i]);
     pthread_mutex_unlock(&g_vp_mu);
     if (v) return (NVNboolean)ok;

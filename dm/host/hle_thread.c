@@ -1023,8 +1023,13 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         int64_t r; uint32_t v = ld32(addr);
         int ok = type == 3 ? ld64(addr) == regs[2] : type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
+        { static int nb = -1; if (nb < 0) { const char *e = getenv("DM_ARB_LOG"); nb = e ? atoi(e) : 0; }
+          if (nb > 0 && ok) { nb--; LOG("[arb] T%#x wait begins addr=%#llx type=%d val=%d word=%#x timeout=%lld", t->id, (unsigned long long)addr, type, val, v, (long long)regs[3]); } }
         if (!ok) r = R_BAD_STATE;
         else { t->waddr = addr; r = block(t, 3, poll_wait_begin((int64_t)regs[3])); }
+        // Diagnostic DM_ARB_LOG=<n>: the first n address waits and signals (thread, type, value, the word's value, result), to follow a lost wake-up
+        { static int nlog = -1; if (nlog < 0) { const char *e = getenv("DM_ARB_LOG"); nlog = e ? atoi(e) : 0; }
+          if (nlog > 0) { nlog--; LOG("[arb] T%#x wait addr=%#llx type=%d val=%d word=%#x → %#llx", t->id, (unsigned long long)addr, type, val, v, (unsigned long long)r); } }
         pthread_mutex_unlock(&G);
         if (ok) poll_wait_end((int64_t)regs[3], r);
         regs[0] = (uint64_t)r; return 1;
@@ -1045,8 +1050,12 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             uint32_t e = (uint32_t)val;
             if (!cas32(addr, &e, (uint32_t)nv)) r = R_BAD_STATE;
         }
+        int woke = 0;
         if (!r) { int n = 0;
-            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0); }
+            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0);
+            woke = n; }
+        { static int nlog = -1; if (nlog < 0) { const char *e = getenv("DM_ARB_LOG"); nlog = e ? atoi(e) : 0; }
+          if (nlog > 0) { nlog--; LOG("[arb] T%#x signal addr=%#llx type=%d val=%d cnt=%d waiters=%d woke=%d word now=%#x → %#llx", cur()->id, (unsigned long long)addr, type, val, cnt, nw, woke, ld32(addr), (unsigned long long)r); } }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }

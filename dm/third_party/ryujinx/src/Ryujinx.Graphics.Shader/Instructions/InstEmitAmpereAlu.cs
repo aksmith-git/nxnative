@@ -61,6 +61,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
             alu(0x096, InstName.Prmt, APrmt, uniform: true);
             alu(0x109, InstName.Popc, APopc);
             alu(0x0bf, InstName.Popc, APopc, uniform: true);
+            // BREV 0x101 / UBREV 0x0be (Pokémon Pokopia's ocean FFT compute shader 9df068f3d7767628: R3 = BREV of the thread index at its start); Maxwell had no BREV of its own
+            // (BFE.BREV), so it is named after BFE
+            alu(0x101, InstName.Bfe, ABrev);
+            alu(0x0be, InstName.Bfe, ABrev, uniform: true);
             alu(0x100, InstName.Flo, AFlo);
             alu(0x0bd, InstName.Flo, AFlo, uniform: true);
             alu(0x01a, InstName.Bfe, ASgxt);
@@ -204,12 +208,22 @@ namespace Ryujinx.Graphics.Shader.Instructions
         {
             AmpereOp x = new(context.CurrOp);
 
-            if (x.Bit(73))
-            {
-                throw AFail(context, "MUFU.F16");
-            }
+            // MUFU.F16 (bit 73; Pokémon Pokopia's pixel shaders, e.g. MUFU.RSQ.F16 R1, R4.H1): the source is a half of the operand, chosen by bits 60..61 as F2F's 16-bit
+            // source is (1 or 3 = the high half), and the result is a half in the destination's low 16 bits, the high 16 zero. Computed in f32, then rounded to f16
+            bool f16 = x.Bit(73);
+            ASrc s = AOne(context, x);
+            Operand res;
 
-            Operand res = AFloat(context, AOne(context, x));
+            if (f16)
+            {
+                Operand v = AGet(context, s);
+                v = s.Kind is AKind.Reg or AKind.UReg && x.Bits(60, 62) is 1 or 3 ? context.UnpackHalf2x16High(v) : context.UnpackHalf2x16Low(v);
+                res = context.FPAbsNeg(v, s.Abs, s.Neg);
+            }
+            else
+            {
+                res = AFloat(context, s);
+            }
 
             res = x.Bits(74, 80) switch
             {
@@ -225,6 +239,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 int op => throw AFail(context, $"MUFU op {op}"),
             };
 
+            if (f16)
+            {
+                res = context.PackHalf2x16(res, ConstF(0f));
+            }
+
             ASet(context, x, res);
         }
 
@@ -234,9 +253,19 @@ namespace Ryujinx.Graphics.Shader.Instructions
             AmpereOp x = new(context.CurrOp);
             ASrc s = AOne(context, x);
 
-            if (x.Bits(84, 86) != 2)
+            int srcSize = x.Bits(84, 86);
+
+            if (srcSize is not 1 and not 2)
             {
-                throw AFail(context, "F2I from a float that is not 32-bit");
+                throw AFail(context, "F2I from a float that is not 16- or 32-bit");
+            }
+
+            Operand src = AGet(context, s);
+
+            if (srcSize == 1)
+            {
+                // A 16-bit source (Pokémon Pokopia): the half that bits 60..61 select, as F2F's 16-bit source, widened to f32 first (exact)
+                src = s.Kind is AKind.Reg or AKind.UReg && x.Bits(60, 62) is 1 or 3 ? context.UnpackHalf2x16High(src) : context.UnpackHalf2x16Low(src);
             }
 
             int size = x.Bits(75, 77);
@@ -249,7 +278,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             IDstFmt dst = (IDstFmt)((signed ? 4 : 0) | System.Math.Max(size, 1));
 
-            EmitF2I(context, DstFmt.F32, dst, (RoundMode2)x.Bits(78, 80), AGet(context, s), x.Rd, s.Abs, s.Neg);
+            EmitF2I(context, DstFmt.F32, dst, (RoundMode2)x.Bits(78, 80), src, x.Rd, s.Abs, s.Neg);
 
             if (size == 0 && x.Rd != RegisterConsts.RegisterZeroIndex)
             {
@@ -348,9 +377,21 @@ namespace Ryujinx.Graphics.Shader.Instructions
         {
             AmpereOp x = new(context.CurrOp);
 
-            if (x.Bit(78) || x.Bit(72))
+            if (x.Bit(72))
             {
-                throw AFail(context, "F2FP.MERGE_C");
+                throw AFail(context, "F2FP with bit 72");
+            }
+
+            if (x.Bit(78))
+            {
+                // F2FP.F16.F32.MERGE_C Rd, -, b, c (Pokémon Pokopia: 0xa3e with A = RZ, b a constant, c = RZ): b converted to the low half, the high half c's low 16 bits
+                // (Mesa NAK's f32 → f16 conversion on SM86 and later emits it this way, with c = RZ: a plain conversion into the low half)
+                (_, ASrc mb, ASrc mc) = AAluSrcs(context, x, abs: false);
+                Operand lo = context.BitwiseAnd(context.PackHalf2x16(AFloat(context, mb), ConstF(0f)), Const(0xffff));
+
+                ASet(context, x, context.BitwiseOr(lo, context.ShiftLeft(AGet(context, mc), Const(16))), AUniform(context));
+
+                return;
             }
 
             (ASrc a, ASrc b) = ASecond(context, x, abs: false);
@@ -428,10 +469,22 @@ namespace Ryujinx.Graphics.Shader.Instructions
             ASet(context, x, context.PackHalf2x16(context.FPSaturate(lo, sat), context.FPSaturate(hi, sat)));
         }
 
+        // The second source of a two-source half-pair op (HADD2, HMUL2): the operand in the 32 slot in every form (a register in form 1, the immediate in forms 2 / 4,
+        // the constant in 3 / 5, the uniform register in 6 / 7), as ASecond gives FADD / FMUL theirs. AHalfSrcs orders B and C for HFMA2, whose B is the 64-slot register
+        // in forms 2, 3 and 7; taking that B read the unused 64 field instead of the immediate: Pokémon Pokopia's blur 8025c44e35cc19ca steps its loop with
+        // HADD2 R6, R6, 2.0h (0x430, field 64 = R0) and added R0 instead, so the loop never ended and the GPU hung
+        private static Operand[] AHalfSecond(EmitterContext context, AmpereOp x)
+        {
+            (_, Operand[] b, Operand[] c) = AHalfSrcs(context, x);
+
+            return x.Form is 1 or 4 or 5 or 6 ? b : c;
+        }
+
         public static void AHadd2(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
-            (Operand[] a, Operand[] b, _) = AHalfSrcs(context, x);
+            (Operand[] a, _, _) = AHalfSrcs(context, x);
+            Operand[] b = AHalfSecond(context, x);
 
             AHalfResult(context, x, context.FPAdd(a[0], b[0]), context.FPAdd(a[1], b[1]));
         }
@@ -439,7 +492,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
         public static void AHmul2(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
-            (Operand[] a, Operand[] b, _) = AHalfSrcs(context, x);
+            (Operand[] a, _, _) = AHalfSrcs(context, x);
+            Operand[] b = AHalfSecond(context, x);
 
             AHalfResult(context, x, context.FPMultiply(a[0], b[0]), context.FPMultiply(a[1], b[1]));
         }
@@ -1027,6 +1081,15 @@ namespace Ryujinx.Graphics.Shader.Instructions
         }
 
         // POPC Rd, b: bit count (63: of the bitwise not)
+        // BREV Rd, b: b's 32 bits in reverse order
+        public static void ABrev(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            bool u = AUniform(context);
+
+            ASet(context, x, context.BitfieldReverse(AGet(context, AOne(context, x, u, neg: false, abs: false))), u);
+        }
+
         public static void APopc(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);

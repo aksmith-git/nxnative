@@ -891,7 +891,8 @@ def jump_adr_offsets(insl, j):
             # A check of the full xN index bounds the same table (DRAGON QUEST I & II main+0x30ee50c: cmp x9,#4).
             m = re.fullmatch(r'([wx]\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
             if m and 'w' + m.group(1)[1:] in idx: cmp = p; break
-            if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
+            # the index changes after the check; general registers only: Mario Kart World main+0xea494 loads ldr s1,[x18,#0xc] between its cmp w1,#5 and the table load, and s1 is not w1
+            if any(p.reg_name(r)[0] in 'wx' and 'w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None
         if cmp is None: return None
         n, at = int(cmp.op_str.split('#')[1], 0) + 1, wa.operands[1].imm
         def targets(tb): return [at + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)] if 0 <= tb and tb + 4 * n <= len(IMG) else None

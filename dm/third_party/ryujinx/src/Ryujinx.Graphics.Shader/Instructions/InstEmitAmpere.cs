@@ -65,10 +65,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
             X(AmpereOpcodes.Kill, InstName.Kil, InstEmit.AKill, B, writesRd: false);
             X(AmpereOpcodes.Ret, InstName.Ret, InstEmit.ARet, B, writesRd: false);
             X(AmpereOpcodes.Call, InstName.Cal, InstEmit.ACall, B, writesRd: false);
-            foreach (int op in new[] { 0x918, 0x91a, 0x945, 0x941, 0x942, 0x948 })
+            // ERRBAR 0x9ab (Pokémon Pokopia's compute shaders, before their barriers) waits for outstanding memory errors to be reported: nothing to wait for here
+            foreach (int op in new[] { 0x918, 0x91a, 0x945, 0x941, 0x942, 0x948, 0x9ab })
             {
                 X(op, InstName.Nop, InstEmit.ANop, InstProps.None, writesRd: false);
             }
+
+            // MEMBAR 0x992 (Pokémon Pokopia's compute shaders): scope in bits 76..78, CTA = 0 orders shared memory within the group, the wider scopes all memory
+            X(0x992, InstName.Membar, InstEmit.AMembar, InstProps.None, writesRd: false);
 
             InstEmit.RegisterAmpereAlu(Alu, X);
             InstEmit.RegisterAmpereMemory(X);
@@ -151,6 +155,20 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
         public static void ANop(EmitterContext context)
         {
+        }
+
+        public static void AMembar(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+
+            if (x.Bits(76, 79) == 0)
+            {
+                context.GroupMemoryBarrier();
+            }
+            else
+            {
+                context.MemoryBarrier();
+            }
         }
 
         private static NotSupportedException AFail(EmitterContext context, string what)
