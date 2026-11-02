@@ -208,21 +208,15 @@ namespace Ryujinx.Graphics.Shader.Instructions
         {
             AmpereOp x = new(context.CurrOp);
 
-            // MUFU.F16 (bit 73; Pokémon Pokopia's pixel shaders, e.g. MUFU.RSQ.F16 R1, R4.H1): the source is a half of the operand, chosen by bits 60..61 as F2F's 16-bit
-            // source is (1 or 3 = the high half), and the result is a half in the destination's low 16 bits, the high 16 zero. Computed in f32, then rounded to f16
-            bool f16 = x.Bit(73);
+            // .F16 (73): the source is the half 60..62 selects, and the result lands in the low 16 bits, as F2F's (the operation itself is computed in 32 bits, and the pack rounds it).
+            // Splatoon Raiders' upscaler network (agl_ndsr.pck) takes powers of its packed halves with LOG2 and EXP2, then joins the results with PRMT 0x5410
+            bool half = x.Bit(73);
             ASrc s = AOne(context, x);
-            Operand res;
+            Operand res = half ? AHalfLanes(context, s, x.Bits(60, 62))[0] : AFloat(context, s);
 
-            if (f16)
+            if (half && x.Bits(74, 80) is 6 or 7)
             {
-                Operand v = AGet(context, s);
-                v = s.Kind is AKind.Reg or AKind.UReg && x.Bits(60, 62) is 1 or 3 ? context.UnpackHalf2x16High(v) : context.UnpackHalf2x16Low(v);
-                res = context.FPAbsNeg(v, s.Abs, s.Neg);
-            }
-            else
-            {
-                res = AFloat(context, s);
+                throw AFail(context, "MUFU.F16 RCP64H / RSQ64H");
             }
 
             res = x.Bits(74, 80) switch
@@ -239,12 +233,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 int op => throw AFail(context, $"MUFU op {op}"),
             };
 
-            if (f16)
-            {
-                res = context.PackHalf2x16(res, ConstF(0f));
-            }
-
-            ASet(context, x, res);
+            ASet(context, x, half ? context.PackHalf2x16(res, ConstF(0f)) : res);
         }
 
         // F2I: destination signed (72) and size (75..77, log2 bytes), rounding (78..80), source size (84..86)
