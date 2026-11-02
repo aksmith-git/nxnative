@@ -13,6 +13,7 @@
 // VP8, VP9 and H.264 decoders share it all (cv_dec_*). Not served: AV1 (no decoder on the host), encrypted input, native image handles (the GPU route) and alias pools
 #include "hle.h"
 #include <pthread.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
@@ -28,6 +29,9 @@
 #define CV_BUSY CV_R(3603)          // the decoder cannot take the packet now
 #define CV_NONE CV_R(3604)          // no buffer to acquire / no picture in the buffer yet
 
+// Diagnostic DM_CV_TRACE=<n>: the first n decoder calls (register, submit, acquire, release, properties, sync point requests and polls)
+static int cv_trace(void) { static int n = -1; if (n < 0) { const char *e = getenv("DM_CV_TRACE"); n = e ? atoi(e) : 0; } return n > 0 ? n-- : 0; }
+#define CVT(...) do { if (cv_trace()) LOG("[cv] " __VA_ARGS__); } while (0)
 typedef struct { uint16_t w, h; uint32_t fmt, mode, magic; uint32_t pad[2]; } cv_pref;   // VideoDecoderImagePreference as the host fills it (returned in x8)
 typedef struct { uint32_t magic; uint16_t w, h; uint32_t fmt, count; vpx_image_t **img; } cv_pool;
 typedef struct { uint32_t magic, dec, idx, gen; } cv_sync;   // nn::gs::NativeSyncHandle (16 bytes)
@@ -188,6 +192,7 @@ static Result cv_dec_fin(void *t) {
     return 0;
 }
 static Result cv_dec_reg(void *t, uint32_t i, void *pool, uint32_t pidx) {
+    CVT("register buffer %u (pool image %u)", i, pidx);
     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) { LOG("[RED] nn::codec::Register…DecoderBuffer index %u", i); return CV_R(2004); }
     pthread_mutex_lock(&d->mu);
     d->buf[i].pool = pool_of(pool); d->buf[i].pidx = pidx; d->buf[i].reg = 1; d->buf[i].filled = 0; d->buf[i].gen = 0; d->buf[i].filled_gen = 0;
@@ -235,6 +240,7 @@ static vpx_image_t *nv12_to_i420(const uint8_t *nv12, unsigned w, unsigned h) { 
 }
 // One packet: decoded at once; its pictures wait for released buffers (end of stream marks the last one, or comes as a buffer of its own)
 static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t size, int64_t ts, bool eos) {
+    CVT("submit %llu bytes eos %d", (unsigned long long)size, eos);
     cv_dec *d = cv_of(t); if (!d) return CV_R(2004);
     pthread_mutex_lock(&d->mu);
     if (d->nheld >= CV_HOLD) { if (d->event) hle_clear_system_event(d->event); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
@@ -261,10 +267,12 @@ static Result cv_dec_acq(uint32_t *idx, cv_sync *sync, void *t) {
     if (!d->fcount) { pthread_mutex_unlock(&d->mu); return CV_NONE; }
     uint32_t i = d->fifo[d->fhead]; d->fhead = (d->fhead + 1) % 8; d->fcount--;
     *idx = i; *sync = (cv_sync){CV_SYNC, d->id, i, d->buf[i].gen};
+    CVT("acquire → buffer %u gen %u filled %d", i, d->buf[i].gen, d->buf[i].filled);
     pthread_mutex_unlock(&d->mu);
     return 0;
 }
 static void cv_dec_rel(void *t, uint32_t i, cv_sync sync) {
+    CVT("release buffer %u (sync gen %u)", i, sync.gen);
     (void)sync; cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS || !d->buf[i].reg) { LOG("[RED] nn::codec::Release…DecoderOutputBuffer index %u", i); return; }
     pthread_mutex_lock(&d->mu);
     d->buf[i].gen++; d->buf[i].filled = 0;
@@ -275,6 +283,7 @@ static void cv_dec_rel(void *t, uint32_t i, cv_sync sync) {
 }
 static Result cv_dec_props(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch, int64_t *ts, bool *eos, void *t, uint32_t i) {
     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) return CV_R(2004);
+    CVT("properties of buffer %u: filled %d gen %u", i, d->buf[i].filled, d->buf[i].gen);
     pthread_mutex_lock(&d->mu);
     int ok = d->buf[i].filled;
     if (ok) { *w = *cw = d->buf[i].w; *h = *ch = d->buf[i].h; *ts = d->buf[i].ts; *eos = d->buf[i].eos != 0; }
@@ -284,9 +293,14 @@ static Result cv_dec_props(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch,
 // The SDK 19 form also reports the picture's colour space (nn::movie::ColorSpace, taken here as 0 BT.601, 1 BT.709): BT.709 when the stream says so, or says nothing and the
 // picture is HD. Mario Kart World calls only this form; without it the SDK's own code ran on the host decoder (an IPC request on the 'DmCV' magic as its session handle) and
 // nn::diag aborted as its first course movie (VP9, 2560x1440) began
+// Mario Kart World aborts on any failure here (main+0x19e818c), where Donkey Kong Bananza's player polls through 3604: a buffer not filled yet (a release racing the decode on
+// another thread; once in a boot, as its first title movie began) is waited for briefly, then reported with the stream's size, as a picture the decoder has not shown
 static Result cv_dec_props_cs(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch, uint32_t *cs, int64_t *ts, bool *eos, void *t, uint32_t i) {
     Result r = cv_dec_props(w, h, cw, ch, ts, eos, t, i);
+    for (int k = 0; r == CV_NONE && k < 50; k++) { usleep(2000); r = cv_dec_props(w, h, cw, ch, ts, eos, t, i); }
     cv_dec *d = cv_of(t);
+    if (r == CV_NONE && d) { static int n; if (n++ < 4) LOG("[codec] %s decoder %u: properties of buffer %u before its picture: reported with the stream's size", k_cv_name[d->codec], d->id, i);
+        *w = *cw = d->w; *h = *ch = d->h; *ts = 0; *eos = false; if (cs) *cs = 0; return 0; }
     if (!r && d && cs) { uint8_t c = d->buf[i].cs; *cs = c == VPX_CS_BT_709 || (c == VPX_CS_UNKNOWN && *h >= 720) ? 1 : 0; }
     return r;
 }
@@ -398,6 +412,7 @@ HLE_FORCE("_ZN2nn6syncpt3sdk25InitializeMultiWaitHolderEPNS_2os19MultiWaitHolder
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk21RequestSyncPointEventEPNS1_18SyncPointEventTypeERKNS1_15SyncPointHandleE", "signalled when the decoder fills the awaited buffer",
           Result, h_spt_request, void *e, const cv_sync *s) {
+    CVT("request event %p for buffer %u gen %u (reached %d)", e, s->idx, s->gen, (int)sync_reached(s));
     spt_unarm(e); hle_clear_system_event(e);
     SPT(e)->want = *s; SPT(e)->armed = 1;
     pthread_mutex_lock(&g_spt_mu); int k = 0; while (k < 64 && g_spt[k]) k++; if (k < 64) g_spt[k] = e; pthread_mutex_unlock(&g_spt_mu);
@@ -410,6 +425,7 @@ HLE_FORCE("_ZN2nn6syncpt3sdk20CancelSyncPointEventEPNS1_18SyncPointEventTypeE", 
 // stayed null and the call crashed the game (pc 0) as its first movie began
 HLE_FORCE("_ZN2nn6syncpt3sdk21TryWaitSyncPointEventEPKNS1_18SyncPointEventTypeE", "whether the awaited buffer is filled", bool, h_spt_trywait, const void *e) {
     const cv_spt *t = SPT(e);
+    CVT("trywait event %p armed %d (buffer %u gen %u)", e, t->armed, t->want.idx, t->want.gen);
     if (t->armed) return sync_reached(&t->want);
     static bool (*trywait)(const void *); if (!trywait && !(trywait = guest_sym("_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::TryWaitSystemEvent missing");
     return trywait(e);
