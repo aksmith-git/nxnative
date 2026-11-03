@@ -528,10 +528,24 @@ static void pool_res(int i) {
     if (g_pools[i].res) return;
     res_add(g_pools[i].buf); res_commit(); g_pools[i].res = 1; g_pool_res_n++;
 }
+// The host's zero-page reclaim (hle_svc.c dm_zero_reclaim) gives guest pages fresh mappings: a zero-copy buffer made over them meanwhile would keep the old pages for the GPU, and pages
+// a buffer wraps (live or kept until the GPU is done, g_dead_pools) are never given new mappings. g_pool_add_mu holds buffer creation off while a reclaim step runs
+static pthread_mutex_t g_pool_add_mu = PTHREAD_MUTEX_INITIALIZER;
+void mtl_pool_add_lock(void) { pthread_mutex_lock(&g_pool_add_mu); }
+void mtl_pool_add_unlock(void) { pthread_mutex_unlock(&g_pool_add_mu); }
+int mtl_pool_overlaps(uintptr_t lo, uintptr_t hi) {   // [lo, hi) meets a pool buffer; caller holds g_pool_add_mu
+    uintptr_t pg = (uintptr_t)getpagesize(); int r = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_npool && !r; i++) { uintptr_t a = g_pools[i].base, b = (g_pools[i].hi + pg - 1) & ~(pg - 1); r = lo < b && a < hi; }
+    if (!r) @autoreleasepool { for (id<MTLBuffer> d in g_dead_pools) { uintptr_t a = (uintptr_t)d.contents, b = a + d.length; if (lo < b && a < hi) { r = 1; break; } } }
+    pthread_mutex_unlock(&g_mu);
+    return r;
+}
 void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
+    pthread_mutex_lock(&g_pool_add_mu);
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
     // Pokémon Legends: Z-A: twice on the Mac a small pool's buffer was refused although its pages were one read-write VM region, both times while another heavy job (a shader compile,
     // a second game instance) took the machine's memory; every run on an idle machine created all of them. Wiring the pages may fail under memory pressure: retry for up to about 2 s
@@ -556,6 +570,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     g_pool_adds++;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
+    pthread_mutex_unlock(&g_pool_add_mu);
 }
 
 void mtl_pool_del(const void *mem) {

@@ -240,11 +240,31 @@ NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) 
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
 static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o);   // sparse virtual pools, see MapVirtual
+// Diagnostic registry of the pools with storage (dm_zero_scan, hle_svc.c): their range and flags, to tell what the guest's resident pages belong to
+typedef struct { uintptr_t lo, hi; uint32_t flags; } pdiag_ent;
+static pdiag_ent *g_pdiag; static int g_npdiag, g_cpdiag; static pthread_mutex_t g_pdiag_mu = PTHREAD_MUTEX_INITIALIZER;
+static void pdiag_add(const void *mem, uint64_t size, uint32_t flags) {
+    pthread_mutex_lock(&g_pdiag_mu);
+    if (g_npdiag == g_cpdiag) { g_cpdiag = g_cpdiag ? 2 * g_cpdiag : 256; g_pdiag = realloc(g_pdiag, (size_t)g_cpdiag * sizeof *g_pdiag); }
+    if (g_pdiag) g_pdiag[g_npdiag++] = (pdiag_ent){(uintptr_t)mem, (uintptr_t)mem + size, flags};
+    pthread_mutex_unlock(&g_pdiag_mu);
+}
+static void pdiag_del(const void *mem) {
+    pthread_mutex_lock(&g_pdiag_mu); for (int i = 0; i < g_npdiag; i++) if (g_pdiag[i].lo == (uintptr_t)mem) { g_pdiag[i] = g_pdiag[--g_npdiag]; break; } pthread_mutex_unlock(&g_pdiag_mu);
+}
+int nvn_pool_at(uintptr_t a, uintptr_t *lo, uintptr_t *hi) {   // the pool holding a (the last made, if several): its range and flags; -1 for none
+    int f = -1; pthread_mutex_lock(&g_pdiag_mu);
+    for (int i = 0; i < g_npdiag; i++) if (a >= g_pdiag[i].lo && a < g_pdiag[i].hi) { f = (int)g_pdiag[i].flags; *lo = g_pdiag[i].lo; *hi = g_pdiag[i].hi; }
+    pthread_mutex_unlock(&g_pdiag_mu); return f;
+}
+int nvn_pool_flags_at(uintptr_t a) {   // the flags of the pool holding a (the last made, if several), -1 for none
+    int f = -1; pthread_mutex_lock(&g_pdiag_mu); for (int i = 0; i < g_npdiag; i++) if (a >= g_pdiag[i].lo && a < g_pdiag[i].hi) f = (int)g_pdiag[i].flags; pthread_mutex_unlock(&g_pdiag_mu); return f;
+}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0;
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a virtual pool's own address range until its first mapping decides (see MapVirtual)
-    else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
+    else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pdiag_add(o->mem, o->size, o->flags); }
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     if (getenv("DM_NVN_VLOG")) { LOG("[nvn] MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (unsigned long long)o->size, o->flags); void dm_backtrace(uint64_t fp); dm_backtrace((uint64_t)__builtin_frame_address(0)); }
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
@@ -256,6 +276,7 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     mtl_alias_drop_pool(p); ((pool_t *)p)->magic = 0;
     if (((pool_t *)p)->flags & 0x200 && ((pool_t *)p)->vp) vpool_release((pool_t *)p);
     if (((pool_t *)p)->mem && !(((pool_t *)p)->flags & 0x200)) {   // A virtual pool's storage is borrowed from a physical pool; do not unregister it
+        pdiag_del(((pool_t *)p)->mem);
  nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); fl_drop(((pool_t *)p)->mem, ((pool_t *)p)->size); } }
 static void ft_flush(const uint8_t *a, uint64_t n);
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {   // see ft_add and nvn_flushed

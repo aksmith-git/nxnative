@@ -68,6 +68,7 @@ static void mem_init_once(void) {
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
     const char *rf = getenv("DM_REGIONS");
     if (rf && *rf) { pthread_t th; if (!pthread_create(&th, NULL, regions_thread, (void *)rf)) pthread_detach(th); }
+    { void dm_zero_reclaim_start(void); dm_zero_reclaim_start(); }
 }
 static void mem_init(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -188,6 +189,106 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // out of phys_footprint, and madvise(MADV_FREE) does nothing to pages that are not writable, though it returns 0 (1 GiB on the Mac: 1,024 MiB still resident and dirty; this: 0).
 // A memory pool's no-copy buffer over the range keeps the old pages for the GPU work still using it until the buffer goes. Returns 1 when the range now holds zero pages;
 // on failure the range is only inaccessible, with its old bytes
+// Zero-page reclaim (DM_ZERO_RECLAIM=<seconds between passes>; 0: off; unset: every 60 s on iOS, off on the Mac). A game's heap holds pages it zeroed and does not use yet (Mario Kart World: about 870 MB of its 3.2 GB
+// resident heap, a quarter): they count in the process's footprint (iOS ends the process at its limit; compressed pages count whole there). A pass gives such pages fresh zero-fill
+// mappings, which read the same and take no memory until touched. Only heap pages outside every memory pool (a pool's zero-copy buffer keeps the GPU on the old pages; mtl_pool_overlaps).
+// A step holds the map lock (SetHeapSize, the alias region) and pool buffer creation off, makes its run read-only, checks it again (a write before that is seen, a write after it
+// waits), maps the still-zero pages anew and makes the rest writable again. A guest write into the run meanwhile faults and waits in zr_fault; a host write (a file read into the
+// guest) waits in zr_prep, as the kernel would refuse it there. The run is at most ZR_RUN host pages, so the wait is short
+enum { ZR_RUN = 64 };
+static _Atomic uintptr_t g_zr_lo, g_zr_hi;   // the run being reclaimed, read-only meanwhile; 0, 0 = none
+static _Atomic uint64_t g_zr_pages, g_zr_passes, g_zr_waits;
+static int zr_in(uintptr_t a, size_t n) { uintptr_t lo = atomic_load(&g_zr_lo), hi = atomic_load(&g_zr_hi); return lo && a < hi && a + n > lo; }
+static int zr_fault(void *addr, int is_write, void *uc) {
+    (void)uc; if (!is_write || !zr_in((uintptr_t)addr, 1)) return 0;
+    atomic_fetch_add(&g_zr_waits, 1); while (zr_in((uintptr_t)addr, 1)) sched_yield();
+    return 1;   // the instruction runs again on a writable page
+}
+static void zr_prep(void *addr, size_t len) { while (zr_in((uintptr_t)addr, len)) sched_yield(); }
+static int zr_zero(const uint8_t *p, size_t n) { const uint64_t *w = (const uint64_t *)p; for (size_t j = 0; j < n / 8; j++) if (w[j]) return 0; return 1; }
+static void zr_step(uintptr_t lo, uintptr_t hi) {   // [lo, hi): resident pages that read zero a moment ago
+    void mtl_pool_add_lock(void), mtl_pool_add_unlock(void); int mtl_pool_overlaps(uintptr_t, uintptr_t);
+    size_t pg = (size_t)getpagesize();
+    pthread_mutex_lock(&g_map_lock); mtl_pool_add_lock();
+    uintptr_t end = (uintptr_t)g_heap + atomic_load(&g_heap_cur); if (hi > end) hi = end;
+    if (lo < hi && !mtl_pool_overlaps(lo, hi)) {
+        atomic_store(&g_zr_hi, hi); atomic_store(&g_zr_lo, lo);
+        if (!mprotect((void *)lo, hi - lo, PROT_READ)) {
+            for (uintptr_t p = lo; p < hi;) {
+                uintptr_t q = p; while (q < hi && zr_zero((const uint8_t *)q, pg)) q += pg;   // a run of pages still zero
+                if (q > p) { if (mmap((void *)p, q - p, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == MAP_FAILED) mprotect((void *)p, q - p, PROT_READ | PROT_WRITE);
+                             else atomic_fetch_add(&g_zr_pages, (q - p) / pg); p = q; }
+                while (q < hi && !zr_zero((const uint8_t *)q, pg)) q += pg;   // written before the run was protected: writable again as it was
+                if (q > p) { mprotect((void *)p, q - p, PROT_READ | PROT_WRITE); p = q; }
+            }
+        }
+        atomic_store(&g_zr_lo, 0); atomic_store(&g_zr_hi, 0);
+    }
+    mtl_pool_add_unlock(); pthread_mutex_unlock(&g_map_lock);
+}
+static void *zr_thread(void *arg) {
+    int every = (int)(intptr_t)arg; size_t pg = (size_t)getpagesize(); char *vec = malloc(1 << 16); if (!vec) return NULL;
+    pthread_setname_np("zero page reclaim");
+    for (;;) {
+        sleep((unsigned)every);
+        uint64_t before = atomic_load(&g_zr_pages); size_t len = atomic_load(&g_heap_cur);
+        for (size_t off = 0; off < len; off += pg << 16) {
+            size_t n = len - off < (pg << 16) ? len - off : pg << 16;
+            if (mincore(g_heap + off, n, vec)) continue;
+            uintptr_t rlo = 0, rhi = 0;
+            for (size_t i = 0; i <= (n + pg - 1) / pg; i++) {
+                uintptr_t p = (uintptr_t)g_heap + off + i * pg; int z = i < (n + pg - 1) / pg && (vec[i] & MINCORE_INCORE) && zr_zero((const uint8_t *)p, pg);
+                if (z && rlo && p == rhi && (rhi - rlo) / pg < ZR_RUN) { rhi += pg; continue; }
+                if (rlo) zr_step(rlo, rhi);
+                rlo = z ? p : 0; rhi = z ? p + pg : 0;
+            }
+        }
+        uint64_t n = atomic_fetch_add(&g_zr_passes, 1) + 1, got = atomic_load(&g_zr_pages) - before;
+        if (n <= 8 || got * pg >= (64u << 20)) LOG("[mem] zero-page reclaim pass %llu: %llu MB given back (%llu MB in all, %llu waiting writes)", (unsigned long long)n, (unsigned long long)(got * pg >> 20),
+                                                 (unsigned long long)(atomic_load(&g_zr_pages) * pg >> 20), (unsigned long long)atomic_load(&g_zr_waits));
+    }
+    return NULL;
+}
+void dm_zero_reclaim_start(void) {
+#if TARGET_OS_IPHONE
+    const char *e = getenv("DM_ZERO_RECLAIM"); int every = e ? atoi(e) : 60;   // on by default where memory is the limit; DM_ZERO_RECLAIM=0 turns it off
+#else
+    const char *e = getenv("DM_ZERO_RECLAIM"); int every = e ? atoi(e) : 0;
+#endif
+    if (every <= 0) return;
+    dm_fault_hook_register(zr_fault); dm_guest_write_prep_register(zr_prep);
+    pthread_t th; pthread_create(&th, NULL, zr_thread, (void *)(intptr_t)every); pthread_detach(th);
+    LOG("[mem] zero-page reclaim every %d s (DM_ZERO_RECLAIM)", every);
+}
+// Diagnostic (DM_ZEROSCAN=<second>, memstat.m): how much of the guest's resident memory is all zero, by host page: the heap up to its size, and the alias region's host pages with a
+// mapped page in them. Pages the system compressed are not read (that would bring them back)
+void dm_zero_scan(void) {
+    size_t pg = (size_t)getpagesize(); uint64_t res[2] = {0, 0}, zero[2] = {0, 0}, zpool[2] = {0, 0};
+    int nvn_pool_at(uintptr_t, uintptr_t *, uintptr_t *); struct { int flags; uint64_t n; } zf[16]; memset(zf, 0, sizeof zf); struct { uintptr_t lo; uint64_t size, n; int flags; } zp[64]; memset(zp, 0, sizeof zp);
+    char *vec = malloc(1 << 16); if (!vec) return;
+    struct { uint8_t *base; size_t len; } r[2] = {{g_heap, atomic_load(&g_heap_cur)}, {g_alias, g_alias_cap}};
+    for (int k = 0; k < 2; k++) for (size_t off = 0; off < r[k].len; off += pg << 16) {
+        size_t n = r[k].len - off < (pg << 16) ? r[k].len - off : pg << 16;
+        if (mincore(r[k].base + off, n, vec)) continue;
+        for (size_t i = 0; i < (n + pg - 1) / pg; i++) {
+            if (!(vec[i] & MINCORE_INCORE)) continue;
+            uint8_t *p = r[k].base + off + i * pg;
+            if (k == 1) { uint64_t a = (uint64_t)(p - g_alias) >> 12; int mapped = 0;
+                for (size_t q = 0; q < pg >> 12; q++) mapped |= (int)((atomic_load(&g_alias_bits[(a + q) >> 6]) >> ((a + q) & 63)) & 1);
+                if (!mapped) continue; }
+            const uint64_t *w = (const uint64_t *)p; size_t j = 0; while (j < pg / 8 && !w[j]) j++;
+            res[k] += pg; if (j == pg / 8) { zero[k] += pg; uintptr_t plo = 0, phi = 0; int fl = nvn_pool_at((uintptr_t)p, &plo, &phi); if (fl >= 0) { zpool[k] += pg; for (int q = 0; q < 16; q++) if (zf[q].n == 0 || zf[q].flags == fl) { zf[q].flags = fl; zf[q].n += pg; break; }
+                for (int q = 0; q < 64; q++) if (zp[q].n == 0 || zp[q].lo == plo) { zp[q].lo = plo; zp[q].size = phi - plo; zp[q].flags = fl; zp[q].n += pg; break; } } }
+        }
+    }
+    free(vec);
+    LOG("[mem] zero scan: heap %llu MB resident, %llu MB of it in all-zero pages (%llu MB of those in memory pools); alias region %llu MB resident, %llu MB all-zero (%llu MB in pools)", (unsigned long long)(res[0] >> 20),
+        (unsigned long long)(zero[0] >> 20), (unsigned long long)(zpool[0] >> 20), (unsigned long long)(res[1] >> 20), (unsigned long long)(zero[1] >> 20), (unsigned long long)(zpool[1] >> 20));
+    char by[512]; int at = 0; for (int q = 0; q < 16 && zf[q].n && at < 480; q++) at += snprintf(by + at, sizeof by - at, " flags %#x: %llu MB;", zf[q].flags, (unsigned long long)(zf[q].n >> 20));
+    LOG("[mem] zero scan: all-zero pool pages by pool flags:%s", by);
+    for (int r = 0; r < 8; r++) { int best = -1; for (int q = 0; q < 64; q++) if (zp[q].n && (best < 0 || zp[q].n > zp[best].n)) best = q; if (best < 0) break;
+        LOG("[mem] zero scan: pool %#lx size %llu MB flags %#x: %llu MB of all-zero resident pages", (unsigned long)zp[best].lo, (unsigned long long)(zp[best].size >> 20), zp[best].flags, (unsigned long long)(zp[best].n >> 20)); zp[best].n = 0; }
+}
 static int guest_release(uintptr_t lo, uintptr_t hi) {
     if (mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != MAP_FAILED) return 1;
     static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) LOG("[RED] guest memory %#lx+%#lx not given back (errno %d): it stays resident", (unsigned long)lo, (unsigned long)(hi - lo), errno);

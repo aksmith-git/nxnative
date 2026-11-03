@@ -98,7 +98,8 @@ static void *memstat_thread(void *p) {
     uint64_t t0 = now_ns();
     const char *ds = getenv("DM_MEMSTAT_DUMP"); int dump_at = ds ? atoi(ds) : -1;
     char dp[1100]; snprintf(dp, sizeof dp, "%s.regions", (const char *)p);
-    for (int sec = 0;; sec++) { sample(f, (now_ns() - t0) / 1e9, dev); if (sec == dump_at) dump_regions(dp); sleep(1); }
+    const char *zs = getenv("DM_ZEROSCAN"); int zero_at = zs ? atoi(zs) : -1; void dm_zero_scan(void);
+    for (int sec = 0;; sec++) { sample(f, (now_ns() - t0) / 1e9, dev); if (sec == dump_at) dump_regions(dp); if (sec == zero_at || (zero_at > 0 && sec % zero_at == 0 && sec)) dm_zero_scan(); sleep(1); }
     return NULL;
 }
 
