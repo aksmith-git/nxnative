@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <unistd.h>
 #include <sched.h>
+#include <TargetConditionals.h>
 #include <time.h>
 #include <stdatomic.h>
 #include <mach/mach.h>
