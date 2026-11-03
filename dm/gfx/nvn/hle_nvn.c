@@ -2609,7 +2609,7 @@ void nvn_sparse_backing(const void *pool, uint64_t a, uint64_t n, uint64_t *keys
         uint64_t o = o0 + (i << 16);
         if (o + 0x10000 > v->size) break;
         const vpte *l = v->pt[o >> 21];
-        if (!l) { i += ((((o >> 21) + 1) << 21) - o >> 16) - 1; continue; }
+        if (!l) { i += (((((o >> 21) + 1) << 21) - o) >> 16) - 1; continue; }
         const uint8_t *p0 = l[(o >> 12) & (VPT_LEAF - 1)].phys; int run = p0 != NULL;
         for (unsigned q = 1; run && q < 16; q++) run = l[((o >> 12) + q) & (VPT_LEAF - 1)].phys == p0 + ((uint64_t)q << 12);
         if (run) keys[i] = (uint64_t)(uintptr_t)p0;
