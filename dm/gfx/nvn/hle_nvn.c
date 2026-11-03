@@ -2112,7 +2112,7 @@ _Static_assert(sizeof(map_req) == 0x28, "NVNmappingRequest");
 // mapping) and the later mappings were refused (`[RED] MapVirtual: non-contiguous mapping`). A pool larger than the application pool is sparse from the start
 enum { NVRUN = 1024, VPT_LEAF = 512 };   // a page-table leaf covers 2 MB
 typedef struct { const uint8_t *phys; uint64_t gen; } vpte;
-struct vpool { const pool_t *pool; uint8_t *base; uint64_t len, size, top; int nrun; struct { uint64_t lo, hi; } run[NVRUN]; vpte **pt; };   // len: reserved; size: the pool's; top: highest mapped end so far (logged per 128 MB)
+struct vpool { const pool_t *pool; uint8_t *base; uint64_t len, size, top; int nrun; struct { uint64_t lo, hi; } run[NVRUN]; vpte **pt; uint64_t gen; };   // gen: the last mapping request of this pool (nvn_sparse_pool_gen)   // len: reserved; size: the pool's; top: highest mapped end so far (logged per 128 MB)
 static struct vpool **g_vp; static int g_nvp, g_cvp;   // the pools with a range of their own, under g_vp_mu
 static pthread_mutex_t g_vp_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_vp_gen;   // bumped per mapping request
@@ -2170,6 +2170,7 @@ static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
 static const vpte *vpt_get(const struct vpool *v, uint64_t o) { const vpte *l = v->pt[o >> 21]; return l ? &l[(o >> 12) & (VPT_LEAF - 1)] : NULL; }
 static void vpt_set(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t *phys) {
     uint64_t gen = atomic_fetch_add(&g_vp_gen, 1) + 1;
+    v->gen = gen;
     for (uint64_t o = 0; o < size; o += 0x1000) {
         vpte **l = &v->pt[(voff + o) >> 21];
         if (!*l && !phys) continue;   // never mapped: stays unmapped
@@ -2534,6 +2535,9 @@ static struct vpool *vpool_at(const void *pool, uint64_t a) {   // caller holds 
 }
 int nvn_sparse_pool(const void *pool) { return pool && ((const pool_t *)pool)->vp; }   // no lock: set at Initialize, cleared at the first mapping (an aliased pool) or Finalize; called per texture lookup
 uint64_t nvn_sparse_gen(void) { return atomic_load(&g_vp_gen); }
+uint64_t nvn_sparse_pool_gen(const void *pool) {   // the generation of the pool's last mapping request: what its textures follow (nvn_mtl.m's GPU-written sparse textures), 0 for a pool that is not sparse
+    pthread_mutex_lock(&g_vp_mu); const struct vpool *v = pool ? ((const pool_t *)pool)->vp : NULL; uint64_t g = v ? v->gen : 0; pthread_mutex_unlock(&g_vp_mu); return g;
+}
 uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) {
     pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); uint64_t miss = 0;
     if (!v) { pthread_mutex_unlock(&g_vp_mu); memset(dst, 0, n); return n; }
@@ -2573,6 +2577,24 @@ int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every pag
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
 // The 64 KB tiles of [a, a + n × 64 KB) in a sparse pool, one pass for a texture's tiles (nvn_mtl.m's Metal sparse textures): st[i] bit 0 its mapping changed after gen or a physical
 // page behind it was written after stamp, bit 1 a page of it is mapped. a is 64 KB aligned in the pool, so a tile lies in one page-table leaf; a leaf never mapped is skipped whole
+// The physical memory behind each 64 KB tile of [a, a + n × 64 KB) in a sparse pool: keys[i] = the host address of its first 4 KB page when its 16 pages are one run of physical memory,
+// else 0 (unmapped, partly mapped or scattered). Tiles with the same key read the same memory: the GPU's page table points them at one physical page (nvn_mtl.m shares their Metal page)
+void nvn_sparse_backing(const void *pool, uint64_t a, uint64_t n, uint64_t *keys) {
+    memset(keys, 0, n * sizeof *keys);
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a);
+    if (!v) { pthread_mutex_unlock(&g_vp_mu); return; }
+    uint64_t o0 = a - (uint64_t)(uintptr_t)v->base;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t o = o0 + (i << 16);
+        if (o + 0x10000 > v->size) break;
+        const vpte *l = v->pt[o >> 21];
+        if (!l) { i += ((((o >> 21) + 1) << 21) - o >> 16) - 1; continue; }
+        const uint8_t *p0 = l[(o >> 12) & (VPT_LEAF - 1)].phys; int run = p0 != NULL;
+        for (unsigned q = 1; run && q < 16; q++) run = l[((o >> 12) + q) & (VPT_LEAF - 1)].phys == p0 + ((uint64_t)q << 12);
+        if (run) keys[i] = (uint64_t)(uintptr_t)p0;
+    }
+    pthread_mutex_unlock(&g_vp_mu);
+}
 void nvn_sparse_tiles(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp, uint8_t *st) {
     memset(st, 0, n);
     pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a);

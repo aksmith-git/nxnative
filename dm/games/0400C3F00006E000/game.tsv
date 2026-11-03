@@ -32,6 +32,9 @@ mem_alias	0x100000000
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x4000000
+# Maps past the application pool fail and the used memory counts the alias region's pages, as on Horizon: MKW's NinVirtualAddressHeap (main+0x681134) sizes itself by what the
+# system reports free, so without this it never let its blocks go (2.4 GB mapped by the fourth race in kartnative's measurements; their profile has the same key)
+mem_map_limit	on
 
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /UI/=layout
