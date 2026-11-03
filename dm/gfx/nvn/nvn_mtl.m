@@ -2705,10 +2705,12 @@ static int msp_min_mb(void) { static int v = -1; if (v < 0) { const char *e = ge
 static int msp_supported(void) { static int v = -1; if (v < 0) { v = 0; if (@available(macOS 26.4, iOS 26.4, *)) v = g_dev.supportsPlacementSparse; } return v; }
 // Block-compressed formats only: such a texture is never a render target, so tex_upgrade never replaces it by a whole texture (an RGBA8 one drawn into would be)
 static int msp_block_compressed(const tex_t *t) { int bw = 1, bh = 1; nvn_fmt_bpb(t->d.format, &bw, &bh); return bw > 1 || bh > 1; }
+// DM_NVN_MSP_PLAIN=0: uncompressed formats stay whole textures (see msp_new)
+static int msp_plain_ok(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_MSP_PLAIN"); v = e ? atoi(e) != 0 : 1; } return v; }
 static int msp_want(const tex_t *t) {
     int mb = msp_min_mb();
     return mb > 0 && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && (t->d.target == NVN_TEXTURE_TARGET_2D || t->d.target == NVN_TEXTURE_TARGET_2D_ARRAY) && t->d.samples <= 1
-        && t->d.levels <= 16 && t->L.size >= ((uint64_t)mb << 20) && !rb_packed_shift(t->d.format) && msp_block_compressed(t) && msp_supported();
+        && t->d.levels <= 16 && t->L.size >= ((uint64_t)mb << 20) && !rb_packed_shift(t->d.format) && (msp_block_compressed(t) || msp_plain_ok()) && msp_supported();
 }
 static void msp_push_free(uint32_t pg) {
     if (g_msp_nfree == g_msp_capfree) { g_msp_capfree = g_msp_capfree ? 2 * g_msp_capfree : 8192; if (!(g_msp_free = realloc(g_msp_free, g_msp_capfree * sizeof *g_msp_free))) MDIE("sparse texture page list: out of memory"); }
@@ -2816,6 +2818,10 @@ static id<MTLTexture> msp_new(NvPkg *pk, const tex_t *t) {
     }
     d.storageMode = MTLStorageModePrivate; d.placementSparsePageSize = MTLSparsePageSize64;
     d.usage |= MTLTextureUsagePixelFormatView;   // a view of another format would otherwise upgrade it (tex_upgrade), a whole texture
+    // An uncompressed one may be drawn into or cleared (Mario Kart World's 6144x6144x2 RGBA8 SNORM sparse array, 383 MB whole, of which its sparse pool maps a part): render-target use
+    // from the start, so tex_upgrade does not replace it by a whole texture, and no lossless compression, so a page shared with another texture (msp_take) reads the same bytes
+    // through both. Shader-write use would make it sparse tier 1 (gsp_new); an image of this kind is upgraded to a whole texture as before
+    if (!msp_block_compressed(t)) { d.usage |= MTLTextureUsageRenderTarget; d.allowGPUOptimizedContents = NO; }
     id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
     if (!mt) { RED_ONCE(143, "sparse texture %ux%ux%u format %#x could not be made as a Metal sparse texture; made whole instead", t->d.width, t->d.height, t->d.depth, t->d.format); return nil; }
     // Unmapped tiles read as 0 only at sparse tier 2 (as the Switch's do); at tier 1 what they read is undefined
