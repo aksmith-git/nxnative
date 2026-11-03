@@ -3327,6 +3327,15 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
            "(tbuf_as_2d); texture type mismatches no view bridges %llu in total (tex_mis_note)",
            vn, (unsigned long long)vh, (unsigned long long)vm, (unsigned long long)tb, (unsigned long long)tm, (unsigned long long)tf, (unsigned long long)tc, (unsigned long long)(tcb >> 20), (unsigned long long)mtl_tex_mis_count()); }
+    { // Pools in the residency set: their size against their resident pages. iOS wires a resident pool whole (pool_res), so on the Mac the difference is what the same pools would add there
+      enum { PW = 256 }; struct { uintptr_t a, b; } pw[PW]; int n = 0; uint64_t size = 0, res = 0, big = 0, big_res = 0; uintptr_t big_at = 0; size_t pg = (size_t)getpagesize(); static char vec[1 << 16];
+      pthread_mutex_lock(&g_mu); for (int i = 0; i < g_npool && n < PW; i++) if (g_pools[i].res) { pw[n].a = g_pools[i].base; pw[n].b = (g_pools[i].hi + pg - 1) & ~(pg - 1); n++; } pthread_mutex_unlock(&g_mu);
+      for (int i = 0; i < n; i++) { uint64_t r = 0;
+          for (uintptr_t c = pw[i].a; c < pw[i].b; c += pg * sizeof vec) { size_t len = pw[i].b - c < pg * sizeof vec ? pw[i].b - c : pg * sizeof vec;
+              if (mincore((void *)c, len, vec)) break; for (size_t k = 0; k < len / pg; k++) r += (vec[k] & MINCORE_INCORE) ? pg : 0; }
+          size += pw[i].b - pw[i].a; res += r; if (pw[i].b - pw[i].a > big) { big = pw[i].b - pw[i].a; big_res = r; big_at = pw[i].a; } }
+      MLOG("pools in the residency set: %d, %llu MB, %llu MB of it resident (%llu MB not; the largest %#lx: %llu MB, %llu MB resident)", n, (unsigned long long)(size >> 20), (unsigned long long)(res >> 20),
+           (unsigned long long)((size - res) >> 20), (unsigned long)big_at, (unsigned long long)(big >> 20), (unsigned long long)(big_res >> 20)); }
     // Memory census (after kartnative's): the residency set's Metal allocations by owner, MB of allocatedSize. Pool buffers wrap guest memory (address space, not memory of their own),
     // so the rest is what Metal holds beside the game's memory. DM_NVN_MEMTOP=<n>: the n largest groups of them (owner, size, format)
     @autoreleasepool {
