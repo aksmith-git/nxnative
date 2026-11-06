@@ -196,8 +196,15 @@ __attribute__((weak)) int dm_opmode(void) { return 0; }   // hle_oe.c's (the con
 static void rom_overlay_set(char *dst, size_t n, const char *env) {
     char *roots = strdup(env); if (!roots) die("rom overlay allocation failed");
     const char *mode = dm_opmode() == 1 ? "docked" : "handheld"; char *save = NULL; dst[0] = 0;
+    // DM_ROMFS_OVERLAY_SET=<name>: each folder's <name>/ subfolder stands for the folder (a set of replacements beside others, e.g. Ocarina of Time's render resolutions);
+    // =none: no replacements (the game's own files). Unset: the folder itself
+    const char *set = getenv("DM_ROMFS_OVERLAY_SET"); if (set && !*set) set = NULL;
+    if (set && !strcmp(set, "none")) { LOG("fs rom overlay: none (DM_ROMFS_OVERLAY_SET=none)"); free(roots); return; }
     for (char *root = strtok_r(roots, ":", &save); root; root = strtok_r(NULL, ":", &save)) {
-        char sub[1100]; struct stat st; snprintf(sub, sizeof sub, "%s/%s", root, mode);
+        char sub[1100], setdir[1100]; struct stat st;
+        if (set) { snprintf(setdir, sizeof setdir, "%s/%s", root, set);
+            if (!stat(setdir, &st) && S_ISDIR(st.st_mode)) root = setdir; else LOG("[RED] fs rom overlay: %s has no set %s (DM_ROMFS_OVERLAY_SET): the folder itself is served", root, set); }
+        snprintf(sub, sizeof sub, "%s/%s", root, mode);
         if (!stat(sub, &st) && S_ISDIR(st.st_mode)) { if (dst[0]) strlcat(dst, ":", n); strlcat(dst, sub, n); LOG("fs rom overlay: %s for the %s mode", sub, mode); }
         if (dst[0]) strlcat(dst, ":", n); strlcat(dst, root, n);
     }
