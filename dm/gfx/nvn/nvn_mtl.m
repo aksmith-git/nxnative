@@ -368,7 +368,9 @@ static void res_top_once(NSError *err) {
     if (!atomic_exchange(&done, 1)) res_top("[RED] GPU out of memory");
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     if (now - atomic_load(&since) > 60000000000ull) { atomic_store(&since, now); atomic_store(&fails, 0); }
-    if (atomic_fetch_add(&fails, 1) >= 32) MDIE("the GPU is out of memory: 32 command buffers failed within a minute (GPU allocated %llu MB, recommended working set %llu MB)", (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20));
+    // An iPad (iPad17,3, Ocarina of Time at 8,523 of 8,192 MB) went down whole before the 32nd failure: on iOS the first one ends the game
+    const int limit = TARGET_OS_IPHONE ? 1 : 32;
+    if (atomic_fetch_add(&fails, 1) + 1 >= limit) MDIE("the GPU is out of memory: %d command buffer(s) failed within a minute (GPU allocated %llu MB, recommended working set %llu MB)", limit, (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20));
 }
 // Since the last call: residency commits (count, time), additions by source line (count, MB; the four largest by bytes) and removals
 void mtl_res_stats(char *out, size_t n) {
@@ -2462,6 +2464,8 @@ static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get
 // Finalize comes: about 10 a frame, 200,000 after an hour in the first shrine. A dead serial resolves through g_ghost instead, a small table whose oldest entry goes when a new one comes,
 // so a record replayed again soon still finds its texture
 enum { NGHOST = 512 };
+// DM_NVN_GHOST=<n> (1-512): how many dead serials keep their texture. Ocarina of Time fills the 512 with its transient render targets: 1.6 GB of GPU memory, 154 MB with 64
+static unsigned ghost_n(void) { static unsigned v; if (!v) { const char *e = getenv("DM_NVN_GHOST"); int n = e ? atoi(e) : NGHOST; v = n < 1 ? 1 : n > NGHOST ? NGHOST : (unsigned)n; if (v != NGHOST) MLOG("finalized texture ring: %u entries (DM_NVN_GHOST)", v); } return v; }
 static nvn_hmap g_tex_live = {.klen = 8};   // serial → the texture object it was initialized in (mtl_tex_release), under g_smu
 static nvn_hmap g_ghost = {.klen = 8}; static uint64_t g_ghost_ring[NGHOST]; static unsigned g_ghost_next; static uint64_t g_ghost_puts;
 void mtl_tex_init(const tex_t *t) {
@@ -2509,7 +2513,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
     if (old) count_add(m == &g_by_serial ? &g_by_serial_held : &g_ghost_held, (__bridge void *)old, -1);
     if (old) obj_drop(old);
     else if (m == &g_ghost) {
-        uint64_t *slot = &g_ghost_ring[g_ghost_next++ % NGHOST];
+        uint64_t *slot = &g_ghost_ring[g_ghost_next++ % ghost_n()];
         if (*slot) { id ev = hm_get_id(&g_ghost, slot); if (ev) { ghost_held_add((__bridge void *)ev, -1); obj_drop(ev); } hm_del_id(&g_ghost, slot); ser_note(*slot); }   // the evicted serial resolves anew too
         *slot = k; g_ghost_puts++;
     }
