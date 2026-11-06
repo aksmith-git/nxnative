@@ -2766,6 +2766,9 @@ def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, 
         if v: cmd += [opt, v]
     for n, r in (programs or {}).items(): cmd += ['--program', f'{n}\t{r["patched"]}\t{r["romfs"]}\t{r["msl"]}\t{r["tables"]}\t{r["html"]}']
     if (game / 'html').is_dir(): cmd += ['--html', game / 'html']
+    # game file replacements beside the RomFS: romfs_overlay_mac when the Mac app's differ from the IPA's (Ocarina of Time: native resolution on the Mac, 720p on the iPhone), else romfs_overlay
+    overlay = next((d for d in (game / 'romfs_overlay_mac', game / 'romfs_overlay') if d.is_dir()), None)
+    if overlay: cmd += ['--romfs-overlay', overlay]; say(f'game file replacements: {overlay}')
     unchanged = False
     def line(ln):
         nonlocal unchanged

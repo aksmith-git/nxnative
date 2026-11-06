@@ -219,6 +219,10 @@ static NSString *program_env(void) {
     if (!romfs) return nil;
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
+    {   // game file replacements packed beside the RomFS (build_ipa.sh: a romfs_overlay folder beside the game's RomFS image), served over it (hle_fs.c DM_ROMFS_OVERLAY)
+        NSString *ov = [res stringByAppendingPathComponent:prog ? [prog stringByAppendingPathComponent:@"romfs_overlay"] : @"romfs_overlay"]; BOOL dir = NO;
+        if ([fm fileExistsAtPath:ov isDirectory:&dir] && dir) { setenv("DM_ROMFS_OVERLAY", ov.fileSystemRepresentation, 0); fprintf(stderr, "boot: game file replacements %s\n", getenv("DM_ROMFS_OVERLAY")); }
+    }
     setenv("DM_NVN_SHMAP", [dmdir stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 0);
     setenv("DM_MSL_DIR", msl.fileSystemRepresentation, 0);
     return dmdir;
