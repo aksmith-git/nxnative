@@ -1020,11 +1020,15 @@ def c2_array(name, ty):
 
 POOL_MIN = 33   # arrays at least this long are pools: Program.cs sizes Ryujinx's handle fallback by the pools, the vendored BindlessElimination keeps 32-entry slot arrays (NvnSlotArrayLength)
 
+# The bit is tested with a plain load and set with an atomic OR only when it is clear. An atomic load (as before) goes past the GPU's L1 to the coherence point on every texture read, and every
+# fragment of a draw tests the same word: on an M4 Pro a full-screen pass of 16 marked reads a pixel took 21.5 ms against 1.6 ms unmarked, 2.7 ms with the plain load (scratchpad microbenchmark,
+# ZEL_build/agents/bw.md). A stale plain load can only see a bit clear that is set (one more OR), or set that the host cleared while the command buffer ran (pool_seen_clear), and that clear is
+# for a new registration, read from the next command buffer on, whose caches start clean
 POOL_MARK = """template<typename P> static inline __attribute__((always_inline)) uint dm_pool_mark(constant P* p, uint i)
 {
-    device atomic_uint* w = reinterpret_cast<device atomic_uint*>(p->seen) + (i >> 5);
+    device uint* w = reinterpret_cast<device uint*>(p->seen) + (i >> 5);
     uint b = 1u << (i & 31u);
-    if (!(atomic_load_explicit(w, memory_order_relaxed) & b)) atomic_fetch_or_explicit(w, b, memory_order_relaxed);
+    if (!(*w & b)) atomic_fetch_or_explicit(reinterpret_cast<device atomic_uint*>(w), b, memory_order_relaxed);
     return i;
 }
 
