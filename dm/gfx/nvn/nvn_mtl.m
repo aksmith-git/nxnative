@@ -1226,6 +1226,7 @@ static void up_owner_check(const char *where) {
 static void up_wait_zero(_Atomic int *v, int site);
 static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); rec_drain(); up_wait_zero(&g_up_pending, WS_OLDQ); } return [g_q commandBuffer]; }
 static post_op *g_post; static int g_npost, g_postcap;
+struct seg_post; static struct seg_post **g_seg_posts; static int g_nseg_posts, g_post_seg0;   // DM_NVN_SEG_POST: this submission's segments' reports so far, and the first op not yet handed to a segment
 // One autorelease pool per submission: submissions run on a guest thread (long-lived, no run loop, never drains the implicit pool), so objects autoreleased in the Metal replay
 // (command buffers, encoders, pass descriptors, etc.) are never released unless put in a pool. Measured on the character select screen of a real iOS device: the host heap grows by about 47 objects per frame, 0.22 MiB/s.
 void *objc_autoreleasePoolPush(void); void objc_autoreleasePoolPop(void *);
@@ -1274,7 +1275,7 @@ void mtl_sub_begin(void) {
     g_commit_blocks = [NSMutableArray array];
     // The overflow buffer created when the previous submission ran out of slots (see g_vis_n >= VIS_SLOTS): retire it. It used to be just cleared here and stayed in the residency set for good (from d2r-mobile 2eb575877)
     if (g_vis && !vis_in_ring(g_vis)) defer_obj_release(g_vis);
-    g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; pend_reset();
+    g_npost = 0; g_post_seg0 = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; pend_reset();
     zskip_clear(); g_zskip_count = 0;
     int pick = -1;
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
@@ -2100,7 +2101,10 @@ static void cbs_feedback(cbs_list *l, NSError *err, const char *where);
 static void lc_land(void);
 // A submission's CPU-side writes at its end (events, samples-passed and counter reports): run once, by its feedback handler or, when a game's SyncWait wakes on the
 // GPU's own signal of the fence first, by that waiter (DM_NVN_FAST_WAKE, on by default): the feedback handler comes 0.26 ms after the GPU end on an M2 Max
-typedef struct { _Atomic uint64_t fence; _Atomic int claimed; int n; post_op *ops; seg_clk *sc; uint32_t seg_last; uint64_t t_commit; } post_rec;   // t_commit: guest ns when it was committed
+// Samples-passed reports (and with DM_NVN_SEG_RB texture readbacks) written when their segment completes (DM_NVN_SEG_POST): a segment's ops, run by its feedback handler or, if the
+// submission's own completion comes first, by that. refs: the segment's handler and the submission's record; state 0 waiting, 2 written (under g_post_mu)
+typedef struct seg_post { _Atomic int state, refs; int n; post_op *ops; } seg_post;
+typedef struct { _Atomic uint64_t fence; _Atomic int claimed; int n; post_op *ops; seg_clk *sc; uint32_t seg_last; uint64_t t_commit; seg_post **early; int nearly; } post_rec;   // t_commit: guest ns when it was committed; early: its segments' reports
 #define POST_RING 128
 static post_rec g_postr[POST_RING];
 static pthread_mutex_t g_post_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2111,18 +2115,30 @@ static int post_claim(post_rec *r, uint64_t fence) {
     if (r->fence != fence || r->claimed) { pthread_mutex_unlock(&g_post_mu); return 0; }
     return 1;
 }
+static void post_samples(post_op *o) {   // Samples passed: the sum of all slots since the reset
+    vis_list *l = o->vis; uint64_t sum = 0;
+    for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
+    free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)o->addr, rec, sizeof rec);
+}
+static void seg_post_put(seg_post *e) { if (atomic_fetch_sub(&e->refs, 1) == 1) { free(e->ops); free(e); } }
+// Once, by whichever comes first, always under g_post_mu as every other completion write: the segment's feedback handler takes the lock, the submission's post_run already holds it, so
+// neither ever finds the other halfway and the lock order is the one completion writes always had (a readback's landing takes the texture locks under it). Both run before the
+// submission's events are published (post_run), so a released waiter sees them
+static void seg_post_run(seg_post *e, int locked) {
+    if (!locked) pthread_mutex_lock(&g_post_mu);
+    if (!atomic_load(&e->state)) { @autoreleasepool { for (int i = 0; i < e->n; i++) { if (e->ops[i].kind == 4) mirror_rb_land(e->ops[i].vis); else post_samples(&e->ops[i]); } } atomic_store(&e->state, 2); }
+    if (!locked) pthread_mutex_unlock(&g_post_mu);
+}
 static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
     // A guest SyncWait may run completion on a thread whose outer pool never drains.
     // MTLBuffer.contents may autorelease its receiver; keep that lifetime inside the completed copy.
     @autoreleasepool {
+    for (int i = 0; i < r->nearly; i++) { seg_post_run(r->early[i], 1); seg_post_put(r->early[i]); }   // the segments' reports first: they come before the rest in submission order
+    free(r->early); r->early = NULL; r->nearly = 0;
     int n = r->n; post_op *ops = r->ops; seg_clk *sc = r->sc; uint32_t seg_last = r->seg_last;
     for (int i = 0; i < n; i++) {
         if (ops[i].kind == 1) continue;   // A terminal release publishes after every earlier GPU write has landed.
-        else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
-            vis_list *l = ops[i].vis; uint64_t sum = 0;
-            for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
-            free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
-        }
+        else if (ops[i].kind == 3) post_samples(&ops[i]);
         else if (ops[i].kind == 4) mirror_rb_land(ops[i].vis);
         else { uint64_t t = rep_ticks(&ops[i], sc, seg_last, c0, c1), rec[2] = {(ops[i].type == 0 || ops[i].type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t}; memcpy((void *)ops[i].addr, rec, sizeof rec); }   // render_cond: a timestamp report's counter field is 0, as on the GPU (see rc_value)
     }
@@ -2187,7 +2203,7 @@ uint64_t mtl_sub_commit(void) {
     seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
     pthread_mutex_lock(&g_post_mu);
     if (!atomic_load(&pr->claimed) && pr->fence) MDIE("post ring: the writes of fence %llu never ran", (unsigned long long)pr->fence);
-    pr->n = n; pr->ops = ops; pr->sc = sc; pr->seg_last = seg_last; pr->t_commit = guest_ns(); atomic_store(&pr->claimed, 0); atomic_store(&pr->fence, fence);
+    pr->n = n; pr->ops = ops; pr->sc = sc; pr->seg_last = seg_last; pr->t_commit = guest_ns(); pr->early = g_seg_posts; pr->nearly = g_nseg_posts; g_seg_posts = NULL; g_nseg_posts = 0; atomic_store(&pr->claimed, 0); atomic_store(&pr->fence, fence);
     pthread_mutex_unlock(&g_post_mu);
     int lost_test = gpu_lost_test();
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
@@ -13704,6 +13720,27 @@ static void sub_cut_begin(void) { g_cut_draw0 = g_stat_draw; }
 // DM_FSTEP_PROBE_RAMP=1 (default) / 0 / ab: a frame-step probe's grace is renewed while its frames keep getting cheaper (nvn_fstep.h FSTEP_RAMP), the time macOS's GPU clock takes to rise for the shorter deadline
 static int probe_ramp_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_FSTEP_PROBE_RAMP", 1); return m; }
 int mtl_probe_ramp_on(void) { return sw_on(probe_ramp_mode()); }
+// DM_NVN_SEG_POST=1 (or ab; off by default): a segment's samples-passed reports are written by its own feedback handler when it completes, instead of all of them at the submission's end.
+// Ocarina of Time makes about 1,400 a frame (one per object's depth prepass query): the game's SyncWait on the frame's fence, woken by the GPU's signal, wrote them itself before returning,
+// on the iPad 0.5-1.2 ms after the GPU end, and the next frame's work waits for that. A report holds what its segment's draws counted, final once the segment completed, as the hardware
+// writes it when it gets there; events and timestamps keep their place at the end
+// DM_NVN_SEG_RB=1 (or ab; needs DM_NVN_SEG_POST): GPU copies read back into a texture's storage (mirror_rb_land) land when their segment completes too. The texture's bytes then reach
+// its storage when the GPU has written them, as on the console, instead of at the fence. iPad Pro M5 (zelda line, both on): the woken SyncWait's return 1.47 -> 0.12 ms after the GPU end, frame -0.7 ms
+static int seg_rb_on(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_SEG_RB", 0); if (m == 1) MLOG("texture readbacks land as their segment completes (DM_NVN_SEG_RB)"); } return sw_on(m); }
+static int seg_post_on(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_SEG_POST", 0); if (m == 1) MLOG("samples-passed reports written as their segment completes (DM_NVN_SEG_POST)"); } return sw_on(m); }
+static seg_post *seg_post_take(void) {   // the samples-passed reports recorded since the last segment, taken out of g_post for the segment being committed
+    if (!seg_post_on() || g_npost <= g_post_seg0) { g_post_seg0 = g_npost; return NULL; }
+    int rb = seg_rb_on(), c = 0; for (int i = g_post_seg0; i < g_npost; i++) c += g_post[i].kind == 3 || (rb && g_post[i].kind == 4);
+    if (!c) { g_post_seg0 = g_npost; return NULL; }
+    seg_post *e = calloc(1, sizeof *e); if (!e || !(e->ops = malloc((size_t)c * sizeof *e->ops))) MDIE("segment reports: out of memory");
+    int w = g_post_seg0;
+    for (int i = g_post_seg0; i < g_npost; i++) { if (g_post[i].kind == 3 || (rb && g_post[i].kind == 4)) e->ops[e->n++] = g_post[i]; else g_post[w++] = g_post[i]; }
+    g_npost = w; g_post_seg0 = w;
+    if (ws_on()) atomic_fetch_add(&g_ws_post[2], (uint64_t)c);
+    atomic_store(&e->refs, 2);
+    g_seg_posts = realloc_or_die(g_seg_posts, (size_t)(g_nseg_posts + 1) * sizeof *g_seg_posts, "the segment reports"); g_seg_posts[g_nseg_posts++] = e;
+    return e;
+}
 static void sub_cut(void) {
     int n = cut_draws();
     if (!g_cb || g_enc) return;
@@ -13723,11 +13760,13 @@ static void sub_cut(void) {
     uint32_t k = g_seg++; seg_clk *sc = NULL;   // reports encoded so far keep this segment's GPU times (seg_ts)
     if (seg_ts()) { if (!g_sclk) { g_sclk = calloc(1, sizeof *g_sclk); atomic_store(&g_sclk->refs, 1); } sc = g_sclk; atomic_fetch_add(&sc->refs, 1); }
     cbs_list *cbs = cbs_take(); uint64_t cbs_fence = g_fence + 1;
+    seg_post *sp = seg_post_take();
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     atomic_fetch_add(&g_seg_inflight, 1);
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         atomic_fetch_sub(&g_seg_inflight, 1);
         gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime);
+        if (sp) { seg_post_run(sp, 0); seg_post_put(sp); }   // its samples-passed reports now, not at the submission's end
         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error); }
         char where[64]; snprintf(where, sizeof where, "fence %llu, segment %u", (unsigned long long)cbs_fence, k); cbs_feedback(cbs, cb.error, where);
