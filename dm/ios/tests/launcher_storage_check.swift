@@ -78,6 +78,34 @@ import Foundation
         expect(mm.rangeLabel(macScale, 0.75) == "960 × 540 (75 %)", "handheld size in pixels")
         let plainScale = try! JSONDecoder().decode(Setting.self, from: Data(#"{"env":"DM_X","kind":"range","label":"X","note":"","default":"1.0","min":0.5,"max":1.0,"step":0.05,"level":"expert"}"#.utf8))
         expect(mm.rangeLabel(plainScale, 0.5) == "50 %" && !plainScale.basic, "no base size: the percentage; an unknown level decodes as Advanced")
+        // Presets: a row whose options carry other rows' values ([value, label, {env: value}]); it is read off the rows, and never saved or put in the environment
+        let presetRow = try! JSONDecoder().decode(Setting.self, from: Data(#"{"env":"DM_PRESET","kind":"preset","section":"Game","label":"Preset","note":"","default":"fast","options":[["fast","Fast",{"DM_FPS_TARGET":"60","DM_PSO_MTL4":"1","DM_NOT_A_ROW":"1"}],["smooth","Smooth",{"DM_FPS_TARGET":"30","DM_PSO_MTL4":"0"}],["custom","Custom",{}]]}"#.utf8))
+        expect(presetRow.options?.map { $0.count } == [2, 2, 2] && presetRow.presets?["fast"]?["DM_FPS_TARGET"] == "60" && presetRow.presets?["custom"] == [:] && presetRow.accepts("smooth") && !presetRow.accepts("fast "), "a preset's options decode as [value, label], their values apart")
+        let pd = UserDefaults(suiteName: suite + ".presets")!
+        defer { pd.removePersistentDomain(forName: suite + ".presets") }
+        setenv("DM_ENV_FILE_KEYS", "", 1); unsetenv("DM_PRESET"); unsetenv("DM_FPS_TARGET"); unsetenv("DM_PSO_MTL4")
+        let pm = LauncherModel([presetRow] + file.settings, defaults: pd)
+        expect(pm.rows(in: "Game").first?.env == "DM_PRESET" && pm.values["DM_PRESET"] == nil && !pm.changed, "the preset row is drawn first in its section and has no value of its own")
+        expect(pm.preset(presetRow) == "fast", "the defaults are the Fast preset's values (a value for a row the list lacks is ignored)")
+        pm.choosePreset(presetRow, "smooth")
+        expect(pm.values["DM_FPS_TARGET"] == "30" && pm.values["DM_PSO_MTL4"] == "0" && pm.preset(presetRow) == "smooth" && pm.changed, "choosing a preset puts its values into the rows")
+        pm.values["DM_FPS_TARGET"] = "60"
+        expect(pm.preset(presetRow) == "custom", "a row changed by hand shows Custom")
+        pm.choosePreset(presetRow, "custom")
+        expect(pm.values["DM_FPS_TARGET"] == "60" && pm.values["DM_PSO_MTL4"] == "0", "choosing Custom changes nothing")
+        pm.apply()
+        expect(pd.string(forKey: "launcher.DM_PSO_MTL4") == "0" && pd.string(forKey: "launcher.DM_FPS_TARGET") == nil && pd.object(forKey: "launcher.DM_PRESET") == nil && getenv("DM_PRESET") == nil && String(cString: getenv("DM_PSO_MTL4")) == "0", "Play saves and sets the rows a preset changed, never the preset itself")
+        pm.reset()
+        expect(pm.preset(presetRow) == "fast" && !pm.changed, "Reset brings back the defaults' preset")
+        pm.choose(presetRow, "smooth")   // the in-game menu's path: each row its own choice
+        expect(pd.string(forKey: "launcher.DM_FPS_TARGET") == "30" && String(cString: getenv("DM_FPS_TARGET")) == "30" && pm.preset(presetRow) == "smooth", "a preset chosen while the game runs saves and sets each of its rows")
+        pm.applySaved()
+        expect(getenv("DM_PRESET") == nil, "without the screen, no preset goes into the environment")
+        setenv("DM_ENV_FILE_KEYS", "DM_PSO_MTL4", 1); setenv("DM_PSO_MTL4", "1", 1); pd.removeObject(forKey: "launcher.DM_FPS_TARGET"); pd.removeObject(forKey: "launcher.DM_PSO_MTL4")
+        let pf = LauncherModel([presetRow] + file.settings, defaults: pd)
+        pf.choosePreset(presetRow, "smooth")
+        expect(pf.values["DM_PSO_MTL4"] == "1" && pf.values["DM_FPS_TARGET"] == "30" && pf.preset(presetRow) == "custom", "a row an env file fixes keeps its value, and the preset shows Custom")
+        setenv("DM_ENV_FILE_KEYS", "", 1); unsetenv("DM_PSO_MTL4"); unsetenv("DM_FPS_TARGET")
         d.set("1", forKey: "launcher.DM_OPMODE"); setenv("DM_ENV_LAUNCH_KEYS", "DM_OPMODE", 1); setenv("DM_OPMODE", "0", 1)   // a front end's launch override over a saved choice
         let launched = LauncherModel(mac.settings, defaults: d)
         expect(launched.values["DM_OPMODE"] == "0" && launched.fixed.contains("DM_OPMODE") && launched.fromLaunch.contains("DM_OPMODE"), "a variable set at launch is shown fixed, over the saved choice")
