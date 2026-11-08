@@ -17,7 +17,7 @@ span (first start to last end) is closer to it. See docs/agents/05-debugging.md,
 import argparse, collections, re, statistics, sys
 
 ENC = re.compile(r'\[gpuprof\] F(\d+)\s+(\d+)\s+([\d.]+) us (render pass|compute / copy)(.*)')
-RP = re.compile(r'^ (\d+) (\d+)x(\d+) colors (\d+) depth (\d+) loads (\d+) draws (\d+) start ([+-][\d.]+) seg (\d+)(?: load (\d+) KB store (\d+) KB)?(?: fmt (\d+)/(\d+))?')
+RP = re.compile(r'^ (\d+) (\d+)x(\d+) colors (\d+) depth (\d+) loads (\d+) draws (\d+) start ([+-][\d.]+) seg (\d+)(?: load (\d+) KB store (\d+) KB)?(?: fmt (\d+)/(\d+))?(?: vtx ([\d.]+))?')
 CP = re.compile(r'^ after pass (\d+) start ([+-][\d.]+) seg (\d+) copies (\d+) \(uniform updates (\d+)\) dispatches (\d+)')
 FRAME = re.compile(r'\[gpuprof\] frame (\d+): render ([\d.]+) ms, compute / copy ([\d.]+) ms over (\d+) encoders.*?first start to last end ([\d.]+) ms')
 AB = re.compile(r'\[ab\] phase (\d+) (\S+): (\d+) frames, GPU p50 ([\d.]+) / p90 ([\d.]+) / mean ([\d.]+) ms, frame p50 ([\d.]+) / p90 ([\d.]+) / mean ([\d.]+) ms'
@@ -39,7 +39,7 @@ def fmt_name(v):
     return MTL_FORMATS.get(v, str(v)) if v else '-'
 
 
-Enc = collections.namedtuple('Enc', 'frame idx us kind pass_ w h colors depth loads draws start seg load_kb store_kb cfmt dfmt copies ubd dispatches')
+Enc = collections.namedtuple('Enc', 'frame idx us kind pass_ w h colors depth loads draws start seg load_kb store_kb cfmt dfmt copies ubd dispatches vtx')   # vtx: DM_NVN_GPUPROF_STAGES, us from the pass start to its vertex stage end (0 without)
 
 
 def parse(lines):
@@ -55,12 +55,12 @@ def parse(lines):
                 if not r: continue
                 g = [int(x) if x is not None else 0 for x in (r.group(1), r.group(2), r.group(3), r.group(4), r.group(5), r.group(6), r.group(7))]
                 e = Enc(f, idx, us, 'R', g[0], g[1], g[2], g[3], g[4], g[5], g[6], float(r.group(8)), int(r.group(9)),
-                        int(r.group(10) or 0), int(r.group(11) or 0), int(r.group(12) or 0), int(r.group(13) or 0), 0, 0, 0)
+                        int(r.group(10) or 0), int(r.group(11) or 0), int(r.group(12) or 0), int(r.group(13) or 0), 0, 0, 0, float(r.group(14) or 0))
             else:
                 c = CP.match(rest)
                 if not c: continue
                 e = Enc(f, idx, us, 'C', int(c.group(1)), 0, 0, 0, 0, 0, 0, float(c.group(2)), int(c.group(3)), 0, 0, 0, 0,
-                        int(c.group(4)), int(c.group(5)), int(c.group(6)))
+                        int(c.group(4)), int(c.group(5)), int(c.group(6)), 0)
             frames.setdefault(f, []).append(e)
             continue
         m = FRAME.search(line)
@@ -106,15 +106,15 @@ def class_key(e, ref_area):
 
 def aggregate(frames, by='shape', only=None):
     """Mean per frame of each group over the frames: (rows sorted by GPU time, number of frames). A row: group, passes, us, draws, load KB, store KB"""
-    agg = collections.defaultdict(lambda: [0, 0.0, 0, 0, 0]); nf = 0
+    agg = collections.defaultdict(lambda: [0, 0.0, 0, 0, 0, 0.0]); nf = 0
     for f, es in frames.items():
         if only and f not in only: continue
         nf += 1
         ref = max((e.w * e.h for e in es if e.kind == 'R' and e.colors), default=0)
         for e in es:
             k = shape_key(e) if by == 'shape' else class_key(e, ref)
-            a = agg[k]; a[0] += 1; a[1] += e.us; a[2] += e.draws; a[3] += e.load_kb; a[4] += e.store_kb
-    rows = [(k, v[0] / nf, v[1] / nf, v[2] / nf, v[3] / nf, v[4] / nf) for k, v in agg.items()] if nf else []
+            a = agg[k]; a[0] += 1; a[1] += e.us; a[2] += e.draws; a[3] += e.load_kb; a[4] += e.store_kb; a[5] += e.vtx
+    rows = [(k, v[0] / nf, v[1] / nf, v[2] / nf, v[3] / nf, v[4] / nf, v[5] / nf) for k, v in agg.items()] if nf else []
     rows.sort(key=lambda r: -r[2])
     return rows, nf
 
@@ -188,7 +188,7 @@ def main(argv=None):
             gap = max(0.0, e.start - end); end = max(end, e.start + e.us)
             if e.kind == 'R':
                 what = (f'pass {e.pass_} {e.w}x{e.h} {e.colors}c{"+d" if e.depth else ""} draws {e.draws} loads {e.loads} '
-                        f'load {e.load_kb} KB store {e.store_kb} KB {fmt_name(e.cfmt)}/{fmt_name(e.dfmt)}')
+                        f'load {e.load_kb} KB store {e.store_kb} KB {fmt_name(e.cfmt)}/{fmt_name(e.dfmt)}' + (f' vtx {e.vtx:.1f} frag {e.us - e.vtx:.1f}' if e.vtx else ''))
             else:
                 what = f'compute / copy after pass {e.pass_}: copies {e.copies} (uniform updates {e.ubd}) dispatches {e.dispatches}'
             print(f'  {e.idx:4d} +{e.start:9.1f} {e.us:8.1f}{"  gap %.1f" % gap if gap >= 1 else "":>12s}  {what}')
@@ -203,11 +203,12 @@ def main(argv=None):
     rows, nf = aggregate(frames, a.by, only)
     tot = sum(r[2] for r in rows) or 1
     print(f'\nmean per frame over {nf} frames, by {a.by}:')
-    print(f'  {"group":52s} {"passes":>7s} {"ms":>7s} {"share":>6s} {"us/pass":>8s} {"draws":>7s} {"load MB":>8s} {"store MB":>8s}')
+    print(f'  {"group":52s} {"passes":>7s} {"ms":>7s} {"share":>6s} {"us/pass":>8s} {"draws":>7s} {"load MB":>8s} {"store MB":>8s}' + (' vertex ms (share)' if any(r[6] for r in rows) else ''))
     shown, rest = rows[:a.top], rows[a.top:]
-    if rest: shown = shown + [('other (%d groups)' % len(rest), sum(r[1] for r in rest), sum(r[2] for r in rest), sum(r[3] for r in rest), sum(r[4] for r in rest), sum(r[5] for r in rest))]
-    for k, n, us, dr, ld, st in shown:
-        print(f'  {k:52s} {n:7.1f} {us / 1e3:7.2f} {100 * us / tot:5.1f}% {us / n if n else 0:8.1f} {dr:7.0f} {ld / 1024:8.1f} {st / 1024:8.1f}')
+    if rest: shown = shown + [('other (%d groups)' % len(rest), sum(r[1] for r in rest), sum(r[2] for r in rest), sum(r[3] for r in rest), sum(r[4] for r in rest), sum(r[5] for r in rest), sum(r[6] for r in rest))]
+    vt = any(r[6] for r in rows)   # DM_NVN_GPUPROF_STAGES: the vertex-stage share of each group's time
+    for k, n, us, dr, ld, st, vx in shown:
+        print(f'  {k:52s} {n:7.1f} {us / 1e3:7.2f} {100 * us / tot:5.1f}% {us / n if n else 0:8.1f} {dr:7.0f} {ld / 1024:8.1f} {st / 1024:8.1f}' + (f' {vx / 1e3:7.2f} ({100 * vx / us if us else 0:3.0f}%)' if vt else ''))
     print(f'  {"total":52s} {sum(r[1] for r in rows):7.1f} {tot / 1e3:7.2f}')
     return 0
 
