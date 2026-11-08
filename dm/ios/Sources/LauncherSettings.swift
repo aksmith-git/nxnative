@@ -160,11 +160,13 @@ final class LauncherModel: ObservableObject {
         fputs("launcher: \(s.env)=\(v) (in-game menu)\n", stderr)
     }
 
-    // DM_LAUNCHER=0: no screen, but the saved choices still apply (only DM_SAVED_CHOICES=0 ignores them); nothing is written
+    // DM_LAUNCHER=0: no screen, but every row still goes into the environment as Play would put it: the saved choices (only DM_SAVED_CHOICES=0 ignores them) and the list's
+    // defaults, which may differ from the host's own (a build whose launcher.json names the device's tested values: Ocarina of Time's Frame rate 0 over the profile's 60; without
+    // the export the host ran its frame step at 60 and the real-speed path at target 0 never ran). Nothing is written
     func applySaved() {
         for s in settings where !fixed.contains(s.env) && !s.isPreset {
             let v = values[s.env] ?? s.def
-            if !s.isDefault(v) { setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v) (saved choice)\n", stderr) }
+            setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v) (\(s.isDefault(v) ? "default" : "saved choice"))\n", stderr)
         }
     }
 }

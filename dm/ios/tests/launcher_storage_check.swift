@@ -54,7 +54,7 @@ import Foundation
         let plain = LauncherModel(file.settings, defaults: d)
         expect(plain.values["DM_FPS_TARGET"] == fps.def, "DM_SAVED_CHOICES=0 starts from the defaults")
         plain.applySaved()
-        expect(getenv("DM_FPS_TARGET") == nil, "DM_SAVED_CHOICES=0: nothing saved goes into the environment")
+        expect(String(cString: getenv("DM_FPS_TARGET")) == fps.def, "DM_SAVED_CHOICES=0: the list's default goes into the environment, not the saved choice")
         plain.apply()
         expect(String(cString: getenv("DM_FPS_TARGET")) == fps.def && d.string(forKey: "launcher.DM_FPS_TARGET") == "30", "DM_SAVED_CHOICES=0: Play uses the screen's values and leaves the saved choices")
         plain.reset()
