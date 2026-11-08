@@ -615,7 +615,10 @@ static int cpre_dbg(void) { static int m = -1; if (m < 0) { m = getenv("DM_NVN_M
 // stage arrays of its first 64 threadgroups (main0_dbg), written as <dir>/cpre_<mesh key>_F<frame>_{c,m}.bin for ZEL_build/agents/grass/dbgcmp.py; a line with the counts of differing words
 static void cpre_dbg_dump(NvShader *ms, int force) {
     if (!ms->dbg_cb || (!force && (uint32_t)atomic_load(&g_cur_frame) < ms->dbg_frame + 8)) return;
-    const char *dir = getenv("DM_NVN_MESH_CPRE_DBG"); if (!dir || dir[0] != '/') dir = getenv("DM_TEMP"); if (!dir) dir = ".";
+    const char *dir = getenv("DM_NVN_MESH_CPRE_DBG"); char home[1024];
+    if (dir && dir[0] == '~' && dir[1] == '/' && getenv("HOME")) { snprintf(home, sizeof home, "%s%s", getenv("HOME"), dir + 1); dir = home; }   // ~/Documents/... on iOS: the app container's
+    if (!dir || dir[0] != '/') dir = getenv("DM_TEMP"); if (!dir) dir = ".";
+    mkdir(dir, 0755);
     const uint32_t *c = (const uint32_t *)ms->dbg_cb.contents, *m = (const uint32_t *)ms->dbg_mb.contents; uint32_t sw = ms->cpre_sw, n;
     const uint32_t *a = (const uint32_t *)((const uint8_t *)ms->dbg_cb.contents + ms->dbg_cb_len - 64); n = a[0];   // the threadgroups the pre-pass dispatched
     char p[1024]; snprintf(p, sizeof p, "%s/cpre_%s_F%u_c.bin", dir, ms->key, ms->dbg_frame); FILE *f = fopen(p, "wb"); if (f) { fwrite(c, 1, ms->dbg_cb_len, f); fclose(f); }
@@ -867,10 +870,10 @@ static void cpre_flush(id en_) {
     for (int i = 0; i < n; i++) { typeof(g_cpre.d[0]) *d = &g_cpre.d[i];
         if (!rt_same(&R.rt, &d->rt)) { g_cpre.lost++; static int said; if (said++ < 3) MLOG("compute pre-pass: a recorded draw's pass never came (the next pass has other targets): dropped"); continue; }
         S = d->st;
-        // DM_NVN_MESH_CPRE_DEQ=<units> (test / iOS): the colour pass draws the grass with depth EQUAL against the depth pass's mesh shaders' [[invariant]] positions; the kernels'
+        // DM_NVN_MESH_CPRE_DEQ=<units> (default 8; 0 = the exact EQUAL test): the colour pass draws the grass with depth EQUAL against the depth pass's mesh shaders' [[invariant]] positions; the kernels'
         // positions match them bit for bit only where the compiler computes the kernel's chain as it computes an invariant one (mkcpre2.py's fp pragma; true on macOS). With the switch an
-        // EQUAL test without depth writes becomes LEQUAL with a constant depth bias of -<units> (toward the camera), so ulp differences pass
-        { static float deq = -1; if (deq < 0) { const char *e = getenv("DM_NVN_MESH_CPRE_DEQ"); deq = e ? (float)atof(e) : 0; if (deq < 0) deq = 0; if (deq > 0) MLOG("DM_NVN_MESH_CPRE_DEQ=%g: the pre-pass's depth EQUAL draws use LEQUAL with a depth bias of -%g", (double)deq, (double)deq); }
+        // EQUAL test without depth writes becomes LEQUAL with a constant depth bias of -<units> (toward the camera), so ulp differences pass. Needed on the iPad (iOS's compiler: every blade failed EQUAL, ipad_v19g3_deq.png); harmless on the Mac
+        { static float deq = -1; if (deq < 0) { const char *e = getenv("DM_NVN_MESH_CPRE_DEQ"); deq = e ? (float)atof(e) : 8; if (deq < 0) deq = 0; if (deq > 0) MLOG("DM_NVN_MESH_CPRE_DEQ=%g: the pre-pass's depth EQUAL draws use LEQUAL with a depth bias of -%g", (double)deq, (double)deq); }
           if (deq > 0 && S.ds.dt && S.ds.df == NVN_DEPTH_FUNC_EQUAL && !S.ds.dw) { S.ds.df = NVN_DEPTH_FUNC_LEQUAL; if (!(S.poly.offset_en & 4)) { S.po.units = 0; S.po.factor = 0; S.po.clamp = 0; } S.poly.offset_en |= 4; S.po.units -= deq; } }
         int mesh = cpre_draw_mesh();
         id<MTLRenderPipelineState> ps = mesh ? cpre_pso_mesh(d->ms, d->fs) : cpre_pso(d->ms, d->fs);
