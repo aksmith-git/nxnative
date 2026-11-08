@@ -35,4 +35,5 @@ DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 pipelines
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.	needs=DM_PSO_MTL4=1
 DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
+DM_FPS_REAL	toggle	-	DM_GAME_FPS_REAL	DM_GAME_FPS_REAL==1	Performance	Real speed at the game's own frame rate	With Frame rate at the game's own, the game's clock follows the measured frame time below 60 fps instead of running slow.
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD

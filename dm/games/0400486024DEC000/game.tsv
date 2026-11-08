@@ -44,6 +44,14 @@ shader_redsum	on
 # The game steps its time by a frame ratio, its base rate / its frame rate, whatever the frame took: frames longer than a vsync played in slow motion. The ratio takes the host's
 # frame step instead (MATCH_FRAME_STEP in patches.py, found by its function on any build that keeps it): 1 vsync at 60 fps, 2 when 60 does not hold, so game time = real time
 fps_target	60
+# Real speed at the game's own pacing (Frame rate = Game's own, DM_FPS_TARGET=0, the iPad's best): there the game's frame rate stays 60 whatever the frames take, so below 60 fps
+# it ran in slow motion. The host measures the present interval (mean of 8, 1-4 vsyncs) and the frame-ratio stub (patches.py frame_step) divides by the matching whole fps in place
+# of the game's 60; the pacing is untouched (nothing is held). DM_FPS_REAL=0 turns it off
+fps_real	on
+# Late frames are not held longer (the launcher's Hold frames when late, DM_FPS_HOLD): with holding on, three late frames stepped to 30, the GPU clock then fell (a probe back
+# to 60 measured the same work at 3.35x its GPU time on an M4 Pro) and the game stayed at 30 for minutes at a GPU time near 16.7 ms; off, a late frame is shown late and the
+# game steps by the vsyncs that passed (M4 Pro, 1280x720: frame p50 17.3 ms, never 30). Under the iOS thermal cap the host still holds 30
+fps_hold	off
 
 # ---- Graphics ----
 # agl wraps its clears in render conditions on Donkey Kong Bananza and Splatoon Raiders; the same library here

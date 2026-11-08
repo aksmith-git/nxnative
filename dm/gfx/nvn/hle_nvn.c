@@ -1999,6 +1999,31 @@ static int fstep_hold(void) {
     }
     return h;
 }
+// Real speed without a frame step (nvn_fstep.h nvn_freal_fps; profile fps_real, DM_FPS_REAL=1 / 0): with no target (DM_FPS_TARGET=0, the game's own pacing) a game whose clock
+// steps a fixed 1/60 s per update (Ocarina of Time: the framework's FPS stays 60 whatever the frames take) runs in slow motion below 60 fps. Once per present the host writes the
+// whole frame rate its last FREAL_WIN present intervals give (15..60) at state +0x2c; the game's frame-ratio stub (its patches.py) divides by it in
+// place of the game's 60 and adds each step at +0x38 (units of 1/60000 s). The pacing is untouched: nothing is held, the frames come as they come. Only a main with the stub
+// reads +0x2c; an older rewrite leaves +0x38 at 0, which the speed line names
+static int freal_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_FPS_REAL"); on = e ? strcmp(e, "0") != 0 : DM_GAME_FPS_REAL; }
+    return on;
+}
+static void freal_tick(const win_t *o) {
+    static nvn_freal r; static uint64_t prev, t0, g0, n; static double vs_sum; static int lo = 999, hi;
+    uint64_t t = now_ns();
+    if (!prev) { prev = t; LOG("[nvn] real speed: no frame rate target, so the game's clock follows the measured present interval (mean of %d, 1..%g vsyncs → %d..60 fps at state +0x2c); frames are not held (%s; DM_FPS_REAL=0 turns it off)", FREAL_WIN, FREAL_MAX, (int)(60 / FREAL_MAX), getenv("DM_FPS_REAL") ? "DM_FPS_REAL" : "game profile fps_real"); return; }
+    double vs = (t - prev) * 60.0 / 1e9; prev = t;
+    int fps = nvn_freal_fps(&r, vs);
+    __atomic_store_n((uint32_t *)(dm_fps_state + 0x2c), (uint32_t)fps, __ATOMIC_RELAXED);
+    vs_sum += vs > FREAL_MAX ? FREAL_MAX : vs; n++; if (fps < lo) lo = fps; if (fps > hi) hi = fps;
+    if (o->presents % 1800 == 0) {   // game time fed by the stub against real time (1.000 = normal speed)
+        uint64_t g = __atomic_load_n((uint64_t *)(dm_fps_state + 0x38), __ATOMIC_RELAXED);
+        if (t0) LOG("[nvn] real speed: game time %.2f s in %.2f s (%.3f of real time); present interval mean %.2f vsyncs over %llu, fps fed %d..%d%s", (g - g0) / 60000.0, (t - t0) / 1e9,
+                    (g - g0) / 60000.0 / ((t - t0) / 1e9), n ? vs_sum / n : 0, (unsigned long long)n, lo, hi, g ? "" : " (nothing stepped: this main's frame-ratio stub does not read +0x2c)");
+        t0 = t; g0 = g; vs_sum = 0; n = 0; lo = 999; hi = 0;
+    }
+}
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
 static void fstep_tick(const win_t *o, int c) {
@@ -2085,6 +2110,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     int c = fps_step_cap();
     if (dm_fps_state) { static int was; if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? (dm_movie_playing() ? " (movie playing)" : thermal_capped() ? " (thermal state serious)" : "") : ""); was = c; } }
     if (c) fstep_tick(o, c);
+    else if (dm_fps_state && freal_on()) freal_tick(o);   // no target: the game's clock follows the measured present interval
     dm_fps_lock_tick();   // after the frame step: at 120 fps the target follows the hold just decided
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     present_cfg(o);

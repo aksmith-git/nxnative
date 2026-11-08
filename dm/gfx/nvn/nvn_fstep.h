@@ -154,3 +154,25 @@ static inline int nvn_fstep_gpu_slowed(nvn_fgpu *g, double gpu, int k, int kmin,
     g->cur = g->n ? g->cur + (gpu - g->cur) / 8 : gpu; g->n++;
     return nvn_fgpu_slow(g);
 }
+
+// Real speed without a frame step (hle_nvn.c freal_tick; profile fps_real, DM_FPS_REAL): with no frame rate target the game paces itself, and one whose clock steps a fixed
+// 1/60 s per update (Ocarina of Time: the framework's FPS is 60 whatever the frames take) runs in slow motion below 60 fps. The host measures the time between its presents,
+// averages the last FREAL_WIN (even steps across the 1 / 2 vsync jitter of a game that presents on the display link's ticks: 45 fps is 1, 2, 1, 2 vsyncs), clamps the mean to
+// 1..FREAL_MAX vsyncs and hands the game the whole frame rate that matches (60 / mean, 15..60), which its frame-step stub feeds to the game's own frame-ratio division.
+// Nothing is held or paced: the frames come as they come, and the game's clock follows them. Only a sample above FREAL_MAX is clamped before it enters the mean (a load, a
+// stall: counted as FREAL_MAX, not replayed); a short one is not (frames that jitter 0.9 / 1.1 around a steady 60 average 1.0, and clamping them below would read 57 fps
+// and run the game fast)
+#define FREAL_WIN 8
+#define FREAL_MAX 4.0
+typedef struct { double hist[FREAL_WIN], sum; int n, at; } nvn_freal;
+// One present: the time since the previous present in vsyncs (1/60 s). Returns the whole frame rate the game steps by, 15..60
+static inline int nvn_freal_fps(nvn_freal *r, double vsyncs) {
+    if (!(vsyncs <= FREAL_MAX)) vsyncs = FREAL_MAX;   // also a NaN
+    if (vsyncs < 0) vsyncs = 0;
+    if (r->n == FREAL_WIN) r->sum -= r->hist[r->at]; else r->n++;
+    r->hist[r->at] = vsyncs; r->sum += vsyncs; r->at = (r->at + 1) % FREAL_WIN;
+    double mean = r->sum / r->n;
+    if (mean < 1.0) mean = 1.0; else if (mean > FREAL_MAX) mean = FREAL_MAX;
+    int fps = (int)(60.0 / mean + 0.5);
+    return fps < 15 ? 15 : fps > 60 ? 60 : fps;
+}

@@ -5,7 +5,7 @@ The screen before the game starts shows the settings the game supports. A settin
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
-- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Real speed at the game's own frame rate](#real-speed-at-the-games-own-frame-rate), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
 - [TV](#tv)
@@ -207,6 +207,13 @@ flowchart LR
 
 - **On** (the default for most games): an even 30 fps (or 20) in heavy scenes instead of a mix of 30 and 60.
 - **Off:** the game keeps aiming at 60; a late frame is shown one refresh later and the next one goes on as usual, so heavy scenes look less even but stay closer to 60 on average.
+
+### Real speed at the game's own frame rate
+
+For games whose clock advances a fixed 1/60 s per frame (The Legend of Zelda: Ocarina of Time). With **Frame rate** at the game's own, such a game runs in slow motion whenever the device falls below 60 fps: at 45 fps everything moves at three quarters of its speed. With this on, the app measures how long its frames really take and the game's clock follows that, so the game runs at normal speed at any frame rate, and frames are still shown as soon as they are ready.
+
+- **On** (the default where the game supports it): normal speed below 60 fps.
+- **Off:** the game's own behaviour, slower below 60 fps. A diagnostic step if the game's timing looks wrong with it on.
 - **When to change it:** turn it off if the game often falls to 30 fps although it is only slightly late.
 
 ### Performance HUD

@@ -360,6 +360,21 @@ int main(void) {
             check(first_len == want[c] && m.s.k == 2 && m.s.failed == 1, b);
         }
     }
+    {   // Real speed without a frame step (nvn_freal_fps): the whole frame rate the measured present intervals give
+        nvn_freal r = {0}; int f = 0;
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, 1.0); check(f == 60, "real speed: steady 60 reads 60 fps");
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, i & 1 ? 0.9 : 1.1); check(f == 60, "  jitter 0.9 / 1.1 around 60 still reads 60 (short samples are not clamped)");
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, i & 1 ? 1.0 : 2.0); check(f == 40, "  frames of 1, 2, 1, 2 vsyncs read 40 fps (the mean, not the last frame)");
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, 1.333); check(f == 45, "  22.2 ms frames read 45 fps");
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, 2.0); check(f == 30, "  33.3 ms frames read 30 fps");
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, 0.5); check(f == 60, "  a mean under one vsync is clamped: never above 60");
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, 6.0); check(f == 15, "  frames of 6 vsyncs read 15 fps (the mean is clamped at 4)");
+        for (int i = 0; i < 20; i++) f = nvn_freal_fps(&r, 1.0);
+        f = nvn_freal_fps(&r, 36.0); check(f >= 40 && f < 60, "  a 600 ms stall enters the mean as 4 vsyncs, not 36");
+        for (int i = 0; i < FREAL_WIN; i++) f = nvn_freal_fps(&r, 1.0); snprintf(b, sizeof b, "  and is out of the mean %d frames later (%d fps)", FREAL_WIN, f); check(f == 60, b);
+        nvn_freal e = {0}; check(nvn_freal_fps(&e, 1.5) == 40, "  the first sample alone gives a rate (1.5 vsyncs: 40 fps)");
+        check(nvn_freal_fps(&e, 0.0 / 0.0) >= 15, "  a NaN sample counts as a long frame, no NaN out");
+    }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }
