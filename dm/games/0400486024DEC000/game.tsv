@@ -65,6 +65,11 @@ fps_hold	off
 render_cond	on
 gpu_timestamps	segment
 draw_barriers	game
+# iPad Pro M5 (zelda line, pull13, 1440x810 held): the same frames took 22 ms of GPU, then 61-85 ms with the same size and passes, thermal state nominal; the rise came over 4 s
+# after CPU-bound frames left the GPU idle (the game also waits on the fence of the frame it just submitted). That is iOS's GPU clock governor reading idle as headroom,
+# as with Breath of the Wild on the iPhone, whose fix is present snapshots: the swapchain texture is free at once, so the next frame starts sooner. Mac M4 Pro, 1440x810: GPU 20.0-20.2 ms
+# with or without them, frame p50 no worse. The launcher's Frame buffering and DM_PRESENT_SNAP=0 override it
+present_snap	on
 # As Tears of the Kingdom: the terrain's height, blend and hole maps are written by the CPU into textures after they are created. Without these keys they stay zero: holes in the ground and the wrong materials
 tex_flush_upload	on
 tex_dirty_upload	on
