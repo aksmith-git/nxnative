@@ -663,7 +663,7 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
 // multiply-adds in the kernel's copy of the body, positions came out 1 ulp off and those blades failed the EQUAL test, leaving white specks (grass.md 4.4)
 enum { CPRE_SLOT = 30, CPRE_MAX = 32, CPRE_HDR = 16, CPRE_MAGIC = 0x43505245 };
 static struct { int n, ready, done; struct { NvShader *ts, *ms, *fs; NvProg *pr; typeof(S) st; p_set_rt rt; uint64_t rec, cg, ag, tgpu, mgpu, fgpu; NSUInteger tai, mai, fai; size_t ioff, ilen; uint32_t cap, tcap; } d[CPRE_MAX];   // tgpu / mgpu / fgpu: the task, mesh and pixel stages' argument tables as written at the draw (the uniform ring blocks of that moment)
-                uint64_t draws, flushes, lost, splits, dispatches; } g_cpre;
+                uint64_t draws, flushes, lost, splits, dispatches, clamped; } g_cpre;
 static nvn_hmap g_pso_cpre = {.klen = sizeof(pso_key)};
 static int cpre_mode(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_MESH_CPRE", 0); if (m == 1) MLOG("DM_NVN_MESH_CPRE: indirect task / mesh draws of colour passes expanded by a compute pre-pass and drawn as indexed triangles (where the library has main0_c / main0_pt / main0_tc)"); } return m; }
 static uint32_t cpre_clamp(uint32_t n, uint32_t lo, uint32_t hi) { return n < lo ? lo : n > hi ? hi : n; }
@@ -682,6 +682,7 @@ static int cpre_fns(NvShader *ms, NvShader *ts) {
         if (why) { if (said++ < 4) MLOG("compute pre-pass: mesh %s (entry %s) stays on the mesh path: %s", ms->key, ms->ventry ? ms->ventry.UTF8String : "-", why); return 0; }
         NSError *e = nil; ms->cpre_ps = cps_new(ms->fn_c, &e);
         if (!ms->cpre_ps) { MLOG("[RED] compute pre-pass: no compute pipeline for mesh %s: %s", ms->key, e.localizedDescription.UTF8String); return 0; }
+        { id<MTLFunction> f2 = [ms->lib newFunctionWithName:@"main0_c_v2"]; NSError *e2 = nil; if (f2) ms->cpre_ps2 = cps_new(f2, &e2); }   // measurement entry (mkcpre2.py --withv2): DM_NVN_MESH_CPRE_V2
         ms->cpre_maxv = (uint16_t)maxv; ms->cpre_maxp = (uint16_t)maxp; ms->cpre_sw = (uint16_t)sw; ms->cpre_tsw = (uint16_t)tsw; ms->cpre_state = 1;
         MLOG("compute pre-pass: mesh %s: %u vertices, %u primitives, %u stage words a threadgroup%s%u", ms->key, maxv, maxp, sw, tsw ? ", task-fed, task stage words " : ", mesh-only ", tsw);
     }
@@ -704,8 +705,8 @@ static int cpre_args_ps(void) {
     static dispatch_once_t once; static int ok;
     dispatch_once(&once, ^{ NSError *e = nil;
         id<MTLLibrary> l = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
-            "kernel void dm_cpre_args(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(rec[0], hdr[1]); args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u; args[4] = n * hdr[2]; args[5] = 1u; args[6] = 0u; args[7] = 0u; args[8] = 0u; }\n"
-            "kernel void dm_cpre_targs(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(rec[0], hdr[4]); args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u; args[4] = 0u; args[5] = 1u; args[6] = 0u; args[7] = 0u; args[8] = 0u; hdr[7] = 0u; }\n"
+            "kernel void dm_cpre_args(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(rec[0], hdr[1]); args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u; args[4] = n * hdr[2]; args[5] = 1u; args[6] = 0u; args[7] = 0u; args[8] = 0u; args[9] = rec[0]; }\n"
+            "kernel void dm_cpre_targs(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(rec[0], hdr[4]); args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u; args[4] = 0u; args[5] = 1u; args[6] = 0u; args[7] = 0u; args[8] = 0u; args[9] = rec[0]; hdr[7] = 0u; }\n"
             "kernel void dm_cpre_margs(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(hdr[7], hdr[1]); args[12] = n; args[13] = 1u; args[14] = 1u; args[4] = n * hdr[2]; }\n" options:nil error:&e];
         const char *names[3] = {"dm_cpre_args", "dm_cpre_targs", "dm_cpre_margs"}; ok = l != nil;
         for (int i = 0; ok && i < 3; i++) { id<MTLFunction> f = [l newFunctionWithName:@(names[i])]; g_cpre_args_ps[i] = f ? cps_new(f, &e) : nil; if (!g_cpre_args_ps[i]) ok = 0; }
@@ -759,15 +760,20 @@ static int cpre_record(NvProg *pr, NvShader *ts, NvShader *ms, NvShader *fs, uin
     uint32_t seen = g_mtk.mem_count, fan = 0, ran = 0, ranm = 0;   // last frame's buffers as the GPU left them: the mesh counter (task draws), the dispatch counts
     const uint32_t *rh = ms->cpre_rb ? (const uint32_t *)((const uint8_t *)ms->cpre_rb.contents + ms->cpre_rb_off) : NULL; if (rh && (rh[9] != CPRE_MAGIC || rh[10] != ms->cpre_rb_frame)) rh = NULL;   // recycled meanwhile
     const uint32_t *ra = ms->cpre_ra ? (const uint32_t *)((const uint8_t *)ms->cpre_ra.contents + ms->cpre_ra_off) : NULL; if (ra && (ra[10] != CPRE_MAGIC || ra[11] != ms->cpre_rb_frame)) ra = NULL;
-    if (rh) { fan = rh[7]; if (fan > 65536) fan = 0; ms->cpre_fan = fan; }
-    if (ra) { ran = ra[0]; ranm = ra[12]; }
+    if (rh) { fan = rh[7]; if (fan > 65536) fan = 0; ms->cpre_fan = fan; if (ts && fan > rh[1]) { g_cpre.clamped++; static int said; if (said++ < 4) MLOG("[RED] compute pre-pass: mesh %s: a fan-out of %u mesh threadgroups, the cap held %u (cut off for a frame; the cap follows)", ms->key, fan, rh[1]); } }
+    uint32_t want = 0;   // last frame's record count before the clamp (args[9]): above the cap it was, part of the draw was cut off (counted, logged once, and the next cap covers it)
+    if (ra) { ran = ra[0]; ranm = ra[12]; want = ra[9]; if (want > ran) { g_cpre.clamped++; static int said; if (said++ < 4) MLOG("[RED] compute pre-pass: mesh %s: %u %s threadgroups recorded, the cap held %u (cut off for a frame; the cap follows)", ms->key, want, ts ? "task" : "mesh", ran); } }
     if (gp_active() && rh) {   // diagnostic: last frame's slice 0 as the pass-through reads it: vertex 0's words (hex = float), the packed id (a0) of vertices 0-7, the first indices
         const uint32_t *h = rh; const uint32_t *sl = h + h[3]; const uint32_t *ix = h + h[0]; if (h[3] < CPRE_HDR + (size_t)h[1] * h[2] + 1 && h[0] == CPRE_HDR) {
         char buf[640]; int o = 0; for (int k = 0; k < 20 && o < 400; k++) { uint32_t w = sl[36 + 32 * k]; float f; memcpy(&f, &w, 4); o += snprintf(buf + o, sizeof buf - o, " %08x=%.4g", w, (double)f); }
         for (int n = 0; n < 8 && o < 600; n++) o += snprintf(buf + o, sizeof buf - o, "%s%08x", n ? " " : "; a0 of vertices 0-7:", sl[36 + (n / 32) * 800 + n % 32 + 128]);
         MLOG("[mtk-rb] mesh %s: v0 words%s; indices %u %u %u %u %u %u", ms->key, buf, ix[0], ix[1], ix[2], ix[3], ix[4], ix[5]); } }
-    uint32_t tcap = ts ? cpre_clamp(seen * 2 + 32, 32, 2048) : 0;
-    uint32_t cap = cpre_cap_env() ? cpre_cap_env() : ts ? cpre_clamp((fan > seen * 4 ? fan + fan / 2 : seen * 4) + 64, 64, 4096) : cpre_clamp(seen * 2 + 64, 64, 4096);
+    // Caps (the buffer's threadgroups; the GPU touches only those dispatched, so a cap costs memory, not traffic): v2's margins, 2x the record as the CPU sees it + 64 (task-fed: 4x, or
+    // 1.5x last frame's fan-out), and at least last frame's count before the clamp. Tighter margins (1.5x + 32) cut whole grass patches off in the dialog (zr_grass_ab7, white
+    // patches: the record the GPU writes in this submission runs ahead of the CPU's view of it), for ~20 % of the ~37 MB a frame
+    uint32_t base = seen > want ? seen : want;
+    uint32_t tcap = ts ? cpre_clamp(base * 2 + 32, 32, 2048) : 0;
+    uint32_t cap = cpre_cap_env() ? cpre_cap_env() : ts ? cpre_clamp((fan > base * 4 ? fan + fan / 2 : base * 4) + 64, 64, 4096) : cpre_clamp(base * 2 + 64, 64, 4096);
     size_t iw = (size_t)cap * ms->cpre_maxp * 3, sw = (size_t)cap * ms->cpre_sw, tw = (size_t)tcap * ms->cpre_tsw, lw = ts ? cap : 0;
     size_t total = CPRE_HDR + iw + sw + tw + lw;
     id<MTLBuffer> cb; size_t co;
@@ -796,8 +802,8 @@ static int cpre_record(NvProg *pr, NvShader *ts, NvShader *ms, NvShader *fs, uin
     ms->cpre_rb = cb; ms->cpre_rb_off = co; ms->cpre_ra = ab; ms->cpre_ra_off = ao;
     g_cpre.draws++;
     { static int imm = -1; if (imm < 0) imm = getenv("DM_NVN_MESH_CPRE_IMM") != NULL; if (imm || cap_dbg) cpre_dispatch(); }   // a DBG capture: now, so the mesh path's draw that follows flushes it   // DM_NVN_MESH_CPRE_IMM=1 (test): now, not at the next pass: an encoder begun later lands the uniform updates the game makes for the draws after this one (ubd_land_compute), and the kernels would read them
-    if (gp_active()) MLOG("[mtk] F%llu pass %llu task %s mesh %s fs %s: compute pre-pass (the record as the CPU sees it) threadgroups %u first %u, task cap %u mesh cap %u, %zu KB; last frame as the GPU left it: %u task / %u mesh threadgroups dispatched, fan-out %u", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_stat_pass, ts ? ts->key : "-", ms->key, fs->key, seen, g_mtk.mem_first,
-                         tcap, cap, total * 4 / 1024, ts ? ran : 0, ts ? ranm : ran, fan);
+    if (gp_active()) MLOG("[mtk] F%llu pass %llu task %s mesh %s fs %s: compute pre-pass (the record as the CPU sees it) threadgroups %u first %u, task cap %u mesh cap %u, %zu KB; last frame as the GPU left it: %u task / %u mesh threadgroups dispatched, fan-out %u; cut off by a cap so far %llu", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_stat_pass, ts ? ts->key : "-", ms->key, fs->key, seen, g_mtk.mem_first,
+                         tcap, cap, total * 4 / 1024, ts ? ran : 0, ts ? ranm : ran, fan, (unsigned long long)g_cpre.clamped);
     static int once; if (!once++) MLOG("compute pre-pass: first draw, task %s mesh %s fragment %s, %u threadgroups seen, %zu KB", ts ? ts->key : "-", ms->key, fs->key, seen, total * 4 / 1024);
     return 1;
 }
@@ -824,7 +830,9 @@ static void cpre_dispatch(void) {
         [ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:resource_vis()];
     }
     for (int i = i0; i < n; i++) { typeof(g_cpre.d[0]) *d = &g_cpre.d[i];
-        enc_c_pso(ce, d->ms->cpre_ps); S = d->st;
+        // DM_NVN_MESH_CPRE_V2=1|ab (measurement, where the overlay has main0_c_v2): v2's kernel traffic (the whole slice zeroed, task-fed: the payload copied into it) against the default
+        static int v2 = -1; if (v2 < 0) { v2 = sw_mode("DM_NVN_MESH_CPRE_V2", 0); if (v2) MLOG("DM_NVN_MESH_CPRE_V2: the pre-pass's mesh kernels are main0_c_v2 (v2's slice zero-fill and payload copy)%s", v2 >= 2 ? " in the DM_AB phases" : ""); }
+        enc_c_pso(ce, v2 && sw_on(v2) && d->ms->cpre_ps2 ? d->ms->cpre_ps2 : d->ms->cpre_ps); S = d->st;
         if (d->mgpu) enc_c_args(ce, d->mgpu, d->mai);
         if (!d->ts) enc_c_args(ce, d->rec + 4, DMSH_MESH_FIRST_SLOT);
         enc_c_args(ce, d->cg, CPRE_SLOT);
