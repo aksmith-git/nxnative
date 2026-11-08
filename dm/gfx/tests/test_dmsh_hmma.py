@@ -17,7 +17,7 @@ import tempfile
 import unittest
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
-NAMES = {'hmma_msl', 'split_params', 'block_end', 'BRACE', 'FUNC_OPEN', 'HMMA_BODY', 'HMMA_ARGS', 'HMMA_CALL', 'TG_ARRAY'}
+NAMES = {'hmma_msl', 'hmma_bslots', 'split_params', 'block_end', 'BRACE', 'FUNC_OPEN', 'HMMA_BODY', 'HMMA_ARGS', 'HMMA_CALL', 'TG_ARRAY', 'HB_COPY'}
 tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
 selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in NAMES)
             or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in NAMES for t in n.targets))]
@@ -150,6 +150,51 @@ kernel void check_seq(device const ushort *in [[buffer(0)]], device uint *out [[
     out[gid * 4] = uint(d4); out[gid * 4 + 1] = uint(e4); out[gid * 4 + 2] = uint(d3); out[gid * 4 + 3] = uint(e3);
 }
 '''
+# B shared by calls (hmma_bslots): calls 1 and 2 use B0 (2 through copies of its words), 3 and 4 B2 with the first use in a branch, 5 B3 whose word is assigned twice,
+# 6 B1 used once. Outputs every call's D; the GPU check compares it with the same kernel with every call's B through the scratch (dm_bf 0)
+BSHARE_KERNEL = '''
+static uint pk(device const ushort* p, int i, int j) { return uint(p[i]) | uint(p[j]) << 16; }
+kernel void check_seq(device const ushort *in [[buffer(0)]], device uint *out [[buffer(1)]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint gid [[thread_position_in_grid]])
+{
+    threadgroup spvUnsafeArray<uint, 1024> scr;
+    device const ushort* x = in + sg * 1152 + (gid / 128) * 4 * 1152;
+    device const ushort *A0 = x, *A1 = x + 256, *B0 = x + 512, *B1 = x + 640, *B2 = x + 768, *B3 = x + 896, *C = x + 1024;
+    int l = int(lane), g = l / 4, t = l % 4, blk = int(sg) * 256;
+    int a00 = int(pk(A0, g * 16 + 2 * t, g * 16 + 2 * t + 1)), a01 = int(pk(A0, (g + 8) * 16 + 2 * t, (g + 8) * 16 + 2 * t + 1));
+    int a02 = int(pk(A0, g * 16 + 8 + 2 * t, g * 16 + 9 + 2 * t)), a03 = int(pk(A0, (g + 8) * 16 + 8 + 2 * t, (g + 8) * 16 + 9 + 2 * t));
+    int a10 = int(pk(A1, g * 16 + 2 * t, g * 16 + 2 * t + 1)), a11 = int(pk(A1, (g + 8) * 16 + 2 * t, (g + 8) * 16 + 2 * t + 1));
+    int a12 = int(pk(A1, g * 16 + 8 + 2 * t, g * 16 + 9 + 2 * t)), a13 = int(pk(A1, (g + 8) * 16 + 8 + 2 * t, (g + 8) * 16 + 9 + 2 * t));
+    float _100 = as_type<float>(pk(B0, (2 * t) * 8 + g, (2 * t + 1) * 8 + g));
+    float _101 = as_type<float>(pk(B0, (2 * t + 8) * 8 + g, (2 * t + 9) * 8 + g));
+    int b10 = int(pk(B1, (2 * t) * 8 + g, (2 * t + 1) * 8 + g)), b11 = int(pk(B1, (2 * t + 8) * 8 + g, (2 * t + 9) * 8 + g));
+    int _120 = int(pk(B2, (2 * t) * 8 + g, (2 * t + 1) * 8 + g));
+    int _121 = int(pk(B2, (2 * t + 8) * 8 + g, (2 * t + 9) * 8 + g));
+    int _130 = int(pk(B3, (2 * t) * 8 + g, (2 * t + 1) * 8 + g));
+    int _131 = int(pk(B3, (2 * t + 8) * 8 + g, (2 * t + 9) * 8 + g));
+    int c0 = int(pk(C, g * 8 + 2 * t, g * 8 + 2 * t + 1)), c1 = int(pk(C, (g + 8) * 8 + 2 * t, (g + 8) * 8 + 2 * t + 1));
+    int f0 = 0, z = 0;
+    int e1, e2, e3, e4, e5, e6, e7, d3 = 0;
+    int _200 = as_type<int>(_100);
+    int _201 = as_type<int>(_101);
+    int d1 = dmsh_hmma16816_f16(l, blk, a00, a01, a02, a03, _200, _201, c0, c1, f0, z, z, z, z, z, z, e1, scr);
+    int _210 = as_type<int>(_100);
+    int _211 = _201;
+    int d2 = dmsh_hmma16816_f16(l, blk, a10, a11, a12, a13, _210, _211, c0, c1, f0, z, z, z, z, z, z, e2, scr);
+    if (g < 4)
+    {
+        d3 = dmsh_hmma16816_f16(l, blk, a00, a01, a02, a03, _120, _121, c0, c1, f0, z, z, z, z, z, z, e3, scr);
+    }
+    int d4 = dmsh_hmma16816_f16(l, blk, a10, a11, a12, a13, _120, _121, c0, c1, f0, z, z, z, z, z, z, e4, scr);
+    int d5 = dmsh_hmma16816_f16(l, blk, a00, a01, a02, a03, _130, _131, c0, c1, f0, z, z, z, z, z, z, e5, scr);
+    _130 = int(pk(B1, (2 * t) * 8 + g, (2 * t + 1) * 8 + g));
+    int d6 = dmsh_hmma16816_f16(l, blk, a10, a11, a12, a13, _130, _131, c0, c1, f0, z, z, z, z, z, z, e6, scr);
+    int d7 = dmsh_hmma16816_f16(l, blk, a10, a11, a12, a13, b10, b11, c0, c1, f0, z, z, z, z, z, z, e7, scr);
+    device uint* o = out + gid * 16;
+    o[0] = uint(d1); o[1] = uint(e1); o[2] = uint(d2); o[3] = uint(e2); o[4] = uint(d3); o[5] = uint(e3); o[6] = uint(d4); o[7] = uint(e4);
+    o[8] = uint(d5); o[9] = uint(e5); o[10] = uint(d6); o[11] = uint(e6); o[12] = uint(d7); o[13] = uint(e7);
+}
+'''
 HALF = r'''#import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 static float h2f(uint16_t h) { __fp16 v; memcpy(&v, &h, 2); return (float)v; }
@@ -203,6 +248,23 @@ int main(int argc, char **argv) {
         }
         printf("%d SIMD-groups, max abs error %.4g, %ld outputs over tolerance\n", n / 32, worst, bad);
         return bad != 0;
+    }
+}
+'''
+# The raw outputs of check_seq (16 words a lane, 16 threadgroups), for comparing two kernels bit for bit
+DUMP_RUNNER = HALF + r'''
+int main(int argc, char **argv) {
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) { printf("no Metal device\n"); return 2; }
+        id<MTLComputePipelineState> ps = pipeline(dev, argv[1], @"check_seq");
+        const int groups = 16, warps = groups * 4;
+        id<MTLBuffer> in = [dev newBufferWithLength:warps * 1152 * 2 options:MTLResourceStorageModeShared], out = [dev newBufferWithLength:groups * 128 * 64 options:MTLResourceStorageModeShared];
+        uint16_t *h = in.contents; srand(5);
+        for (int i = 0; i < warps * 1152; i++) h[i] = f2h((rand() % 2001 - 1000) / 1000.0f);
+        memset(out.contents, 0, out.length); run(dev, ps, in, out, groups);
+        const uint32_t *o = out.contents; for (int i = 0; i < groups * 128 * 16; i++) printf("%08x\n", o[i]);
+        return 0;
     }
 }
 '''
@@ -272,9 +334,9 @@ class HmmaRewrite(unittest.TestCase):
     def test_callers_get_their_matrices_and_shared_memory(self):
         out = hmma_msl(HEAD + HELPER + SEQ_KERNEL)
         kernel = out[out.index('kernel void check_seq'):]
-        self.assertIn('{\n    simdgroup_half8x8 dm_acc[16], dm_am[4];\n', kernel)   # first in the body
-        self.assertEqual(kernel.count(', scr, dm_acc, dm_am, shm)'), 4)              # every call: the matrices, then the one other threadgroup array
-        self.assertIn('thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4], threadgroup spvUnsafeArray<uint, 1280>& dm_shm)', out)
+        self.assertIn('{\n    simdgroup_half8x8 dm_acc[16], dm_am[4], dm_bm[2];\n', kernel)   # first in the body
+        self.assertEqual(kernel.count(', scr, dm_acc, dm_am, shm, dm_bm, 0)'), 4)            # every call: the matrices, the one other threadgroup array, B's slots (none here)
+        self.assertIn('thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4], threadgroup spvUnsafeArray<uint, 1280>& dm_shm, thread simdgroup_half8x8 *bm, const int dm_bf)', out)
         self.assertIn('adirect = (f & 16) != 0', out)
 
     def test_two_other_arrays_load_a_through_the_scratch(self):
@@ -282,11 +344,18 @@ class HmmaRewrite(unittest.TestCase):
         out = hmma_msl(HEAD + HELPER + src)
         self.assertNotIn('dm_shm', out)
         self.assertIn('adirect = false', out)
-        self.assertEqual(out.count(', scr, dm_acc, dm_am)'), 4)
+        self.assertEqual(out.count(', scr, dm_acc, dm_am, dm_bm, 0)'), 4)
 
     def test_kernel_unchanged_but_its_calls(self):
         out = hmma_msl(HEAD + HELPER + KERNEL)
-        self.assertIn(KERNEL.strip().replace('d1, scr)', 'd1, scr, dm_acc, dm_am)').replace('{\n    threadgroup', '{\n    simdgroup_half8x8 dm_acc[16], dm_am[4];\n    threadgroup', 1), out)
+        self.assertIn(KERNEL.strip().replace('d1, scr)', 'd1, scr, dm_acc, dm_am, dm_bm, 0)').replace('{\n    threadgroup', '{\n    simdgroup_half8x8 dm_acc[16], dm_am[4], dm_bm[2];\n    threadgroup', 1), out)
+
+    def test_shared_b_kept_in_a_slot(self):
+        out = hmma_msl(HEAD + HELPER + BSHARE_KERNEL)
+        calls = re.findall(r'dmsh_hmma16816_f16\(l, [^;]*dm_bm, (\d+)\)', out)
+        # 1 keeps B0 in slot 0 (1 | 0 << 2), 2 takes it through copies (2); 3 and 4 (B2 first used in a branch) and 5 and 6 (a word assigned twice) keep no slot; 7 (used once)
+        self.assertEqual(calls, ['1', '2', '0', '0', '0', '0', '0'])
+        self.assertIn('dm_bm[2];', out)
 
     def test_other_shaders_unchanged(self):
         src = HEAD + KERNEL.replace('dmsh_hmma16816_f16(l, blk, a0, a1, a2, a3, b0, b1, c0, c1, z, z, z, z, z, z, z, d1, scr)', 'a0')
@@ -322,6 +391,25 @@ class HmmaRewrite(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('xcrun') and shutil.which('clang'), 'needs Xcode')
 class HmmaOnGpu(unittest.TestCase):
+    def test_kept_b_same_bits(self):
+        kept = hmma_msl(HEAD + HELPER + BSHARE_KERNEL)
+        self.assertIn('dm_bm, 2)', kept)
+        plain = re.sub(r'dm_bm, \d+\)', 'dm_bm, 0)', kept)
+        outs = []
+        for msl in (kept, plain):
+            with tempfile.TemporaryDirectory() as d:
+                d = Path(d)
+                (d / 'h.metal').write_text(msl)
+                subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance', str(d / 'h.metal'), '-o', str(d / 'h.air')], check=True)
+                subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', str(d / 'h.air'), '-o', str(d / 'h.metallib')], check=True)
+                (d / 'run.m').write_text(DUMP_RUNNER)
+                subprocess.run(['clang', '-fobjc-arc', '-O1', str(d / 'run.m'), '-framework', 'Metal', '-framework', 'Foundation', '-o', str(d / 'run')], check=True)
+                r = subprocess.run([str(d / 'run'), str(d / 'h.metallib')], capture_output=True, text=True)
+                if r.returncode == 2: self.skipTest(r.stdout.strip())
+                outs.append(r.stdout)
+        self.assertEqual(outs[0], outs[1])
+        self.assertGreater(len(set(outs[0].split())), 1000)
+
     def test_matches_reference(self):
         compile_and_run(self, hmma_msl(HEAD + HELPER + KERNEL), RUNNER)
 

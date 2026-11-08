@@ -1,5 +1,6 @@
 """textureGatherOffsets (dmsh_build.py gather_offsets): each call of spirv-cross's spvGatherConstOffsets / spvGatherCompareConstOffsets becomes its four gathers with their offsets written out,
-in plain and array forms, and on this Mac's GPU a compute shader's rewritten gathers match texel reads in every lane, on two runs."""
+in plain and array forms, or one gather with a swizzle when the four offsets are one 2x2 footprint (gather_quad); on this Mac's GPU a compute shader's rewritten gathers match texel
+reads in every lane, on two runs, and the one-gather form matches the four gathers over a whole texture, its edges included, with clamped and repeating samplers."""
 import ast
 from pathlib import Path
 import re
@@ -10,11 +11,11 @@ import unittest
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
-selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name == 'gather_offsets')
-            or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in ('GATHER4', 'MAC_METAL') for t in n.targets))]
+selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in ('gather_offsets', 'gather_quad'))
+            or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in ('GATHER4', 'GATHER_COMP', 'MAC_METAL') for t in n.targets))]
 scope = {'re': re}
 exec(compile(ast.Module(body=selected, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), scope)
-gather_offsets, MAC_METAL = scope['gather_offsets'], scope['MAC_METAL']
+gather_offsets, gather_quad, MAC_METAL = scope['gather_offsets'], scope['gather_quad'], scope['MAC_METAL']
 
 HEAD = '''#include <metal_stdlib>
 using namespace metal;
@@ -39,6 +40,8 @@ inline spvGatherReturn<Tex, Tp...> spvGatherConstOffsets(const thread Tex& t, sa
     return spvGatherReturn<Tex, Tp...>(rslts[0].w, rslts[1].w, rslts[2].w, rslts[3].w);
 }
 constant spvUnsafeArray<int2, 4> _9 = spvUnsafeArray<int2, 4>({ int2(0), int2(1, 0), int2(0, 1), int2(1) });
+constant spvUnsafeArray<int2, 4> _10 = spvUnsafeArray<int2, 4>({ int2(0), int2(2, 0), int2(0, 2), int2(2) });
+constant spvUnsafeArray<int2, 4> _11 = spvUnsafeArray<int2, 4>({ int2(0), int2(-1), int2(0, -1), int2(-1, 0) });
 '''
 KERNEL = '''
 kernel void k(texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], device atomic_uint* bad [[buffer(0)]], uint3 id [[thread_position_in_grid]])
@@ -55,6 +58,17 @@ kernel void k(texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], devic
     atomic_fetch_add_explicit(bad + 1, 1u, memory_order_relaxed);
 }
 '''
+QUAD_KERNEL = '''
+kernel void k(texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], device atomic_uint* bad [[buffer(0)]], uint3 id [[thread_position_in_grid]])
+{
+    float2 c = (float2(id.xy) + float2(0.25, 0.75)) / float2(t.get_width(), t.get_height());
+    float4 a = spvGatherConstOffsets(t, s, _9, component::y, c), b = spvGatherConstOffsets(t, s, _11, component::x, c);
+    float4 r = float4(t.gather(s, c, int2(0), component::y).w, t.gather(s, c, int2(1, 0), component::y).w, t.gather(s, c, int2(0, 1), component::y).w, t.gather(s, c, int2(1), component::y).w);
+    float4 q = float4(t.gather(s, c, int2(0), component::x).w, t.gather(s, c, int2(-1), component::x).w, t.gather(s, c, int2(0, -1), component::x).w, t.gather(s, c, int2(-1, 0), component::x).w);
+    if (any(a != r) || any(b != q)) atomic_fetch_add_explicit(bad, 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(bad + 1, 1u, memory_order_relaxed);
+}
+'''
 RUNNER = '''#import <Metal/Metal.h>
 #include <stdio.h>
 int main(int ac, char **av) { @autoreleasepool {
@@ -64,10 +78,11 @@ int main(int ac, char **av) { @autoreleasepool {
     enum { W = 256, H = 128 }; MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:W height:H mipmapped:NO]; td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [d newTextureWithDescriptor:td]; static float px[H][W][4]; for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { px[y][x][0] = x; px[y][x][1] = y * W + x + 1; px[y][x][2] = y; px[y][x][3] = 1; }
     [t replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:px bytesPerRow:W * 16];
-    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge; id<MTLSamplerState> s = [d newSamplerStateWithDescriptor:sd];
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.sAddressMode = sd.tAddressMode = ac > 3 ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeClampToEdge; id<MTLSamplerState> s = [d newSamplerStateWithDescriptor:sd];
+    int full = ac > 2;
     id<MTLCommandQueue> q = [d newCommandQueue]; id<MTLBuffer> o = [d newBufferWithLength:8 options:MTLResourceStorageModeShared];
     for (int r = 0; r < 2; r++) { id<MTLCommandBuffer> c = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [c computeCommandEncoder]; [ce setComputePipelineState:p]; [ce setTexture:t atIndex:0]; [ce setSamplerState:s atIndex:0]; [ce setBuffer:o offset:0 atIndex:0];
-        [ce dispatchThreads:MTLSizeMake(W - 2, H - 2, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)]; [ce endEncoding]; [c commit]; [c waitUntilCompleted]; }
+        [ce dispatchThreads:MTLSizeMake(full ? W : W - 2, full ? H : H - 2, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)]; [ce endEncoding]; [c commit]; [c waitUntilCompleted]; }
     const uint32_t *v = o.contents; printf("%u %u\\n", v[0], v[1]); return 0;
 } }
 '''
@@ -79,15 +94,23 @@ class Rewrite(unittest.TestCase):
         self.assertEqual(gather_offsets(src), src)
 
     def test_call_becomes_four_gathers(self):
-        out = gather_offsets(HEAD + 'float4 f(texture2d<float> t, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _9, component::z, select(c, float2(0.0), isnan(c))); return a; }\n')
+        out = gather_offsets(HEAD + 'float4 f(texture2d<float> t, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _10, component::z, select(c, float2(0.0), isnan(c))); return a; }\n')
         self.assertNotIn('= spvGatherConstOffsets(', out)
-        self.assertIn('dm_gather4(t.gather(s, select(c, float2(0.0), isnan(c)), int2(0), component::z).w, t.gather(s, select(c, float2(0.0), isnan(c)), int2(1, 0), component::z).w, '
-                      't.gather(s, select(c, float2(0.0), isnan(c)), int2(0, 1), component::z).w, t.gather(s, select(c, float2(0.0), isnan(c)), int2(1), component::z).w)', out)
+        self.assertIn('dm_gather4(t.gather(s, select(c, float2(0.0), isnan(c)), int2(0), component::z).w, t.gather(s, select(c, float2(0.0), isnan(c)), int2(2, 0), component::z).w, '
+                      't.gather(s, select(c, float2(0.0), isnan(c)), int2(0, 2), component::z).w, t.gather(s, select(c, float2(0.0), isnan(c)), int2(2), component::z).w)', out)
+
+    def test_footprint_becomes_one_gather(self):
+        out = gather_offsets(HEAD + 'float4 f(texture2d<float> t, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _9, component::z, c); float4 b = spvGatherConstOffsets(t, s, _11, component::y, c); return a + b; }\n')
+        self.assertIn('float4 a = t.gather(s, c, int2(0, 0), component::z).wzxy;', out)
+        self.assertIn('float4 b = t.gather(s, c, int2(-1, -1), component::y).ywzx;', out)
+        self.assertEqual(gather_quad(['int2(3)', 'int2(4, 3)', 'int2(3, 4)', 'int2(4)']), ('int2(3, 3)', 'wzxy'))
+        self.assertIsNone(gather_quad(['int2(0)', 'int2(1, 0)', 'int2(0, 1)', 'int2(2)']))
 
     def test_array_and_compare(self):
-        out = gather_offsets(HEAD + 'float4 f(texture2d_array<float> t, depth2d<float> z, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _9, component::x, c, uint(rint(1.0))); float4 b = spvGatherCompareConstOffsets(z, s, _9, c, 0.5); return a + b; }\n')
-        self.assertIn('t.gather(s, c, uint(rint(1.0)), int2(1, 0), component::x).w', out)
-        self.assertIn('z.gather_compare(s, c, 0.5, int2(0, 1)).w', out)
+        out = gather_offsets(HEAD + 'float4 f(texture2d_array<float> t, depth2d<float> z, sampler s, float2 c) { float4 a = spvGatherConstOffsets(t, s, _10, component::x, c, uint(rint(1.0))); float4 b = spvGatherCompareConstOffsets(z, s, _10, c, 0.5); float4 e = spvGatherCompareConstOffsets(z, s, _9, c, 0.5); return a + b + e; }\n')
+        self.assertIn('t.gather(s, c, uint(rint(1.0)), int2(2, 0), component::x).w', out)
+        self.assertIn('z.gather_compare(s, c, 0.5, int2(0, 2)).w', out)
+        self.assertIn('float4 e = z.gather_compare(s, c, 0.5, int2(0, 0)).wzxy;', out)
 
     def test_offsets_not_constant_refused(self):
         with self.assertRaises(ValueError):
@@ -107,6 +130,20 @@ class OnGpu(unittest.TestCase):
             out = subprocess.run([str(w / 'r'), str(w / 'k.metallib')], capture_output=True, text=True).stdout.split()
             self.assertEqual(out[0], '0', out)
             self.assertEqual(int(out[1]), 2 * 254 * 126)
+
+    def test_one_gather_matches_four_whole_texture(self):
+        with tempfile.TemporaryDirectory() as w:
+            w = Path(w)
+            (w / 'k.metal').write_text(gather_offsets(HEAD + QUAD_KERNEL))
+            self.assertNotIn('dm_gather4(', (w / 'k.metal').read_text().split(scope['GATHER4'])[1])
+            subprocess.run(MAC_METAL + [str(w / 'k.metal'), '-o', str(w / 'k.air')], check=True, capture_output=True)
+            subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', str(w / 'k.air'), '-o', str(w / 'k.metallib')], check=True)
+            (w / 'r.m').write_text(RUNNER)
+            subprocess.run(['clang', '-fobjc-arc', '-framework', 'Metal', '-framework', 'Foundation', str(w / 'r.m'), '-o', str(w / 'r')], check=True, capture_output=True)
+            for extra in (['full'], ['full', 'repeat']):
+                out = subprocess.run([str(w / 'r'), str(w / 'k.metallib')] + extra, capture_output=True, text=True).stdout.split()
+                self.assertEqual(out[0], '0', (extra, out))
+                self.assertEqual(int(out[1]), 2 * 256 * 128)
 
 
 if __name__ == '__main__':

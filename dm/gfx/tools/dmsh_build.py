@@ -74,7 +74,8 @@ HMMA_BODY = '''{
     const bool areuse = f & 1, cslot = f & 2, dslot = f & 4, czero = f & 8, adirect = %(adirect)s;
     uint g = uint(%(lane)s) >> 2, t = uint(%(lane)s) & 3;
     if (!areuse && !adirect) { s[g * 8 + t] = uint(%(a0)s); s[(g + 8) * 8 + t] = uint(%(a1)s); s[g * 8 + 4 + t] = uint(%(a2)s); s[(g + 8) * 8 + 4 + t] = uint(%(a3)s); }
-    s[128 + g * 8 + t] = uint(%(b0)s); s[128 + g * 8 + 4 + t] = uint(%(b1)s);
+    const int bmode = dm_bf & 3, bk = dm_bf >> 2;
+    if (bmode != 2) { s[128 + g * 8 + t] = uint(%(b0)s); s[128 + g * 8 + 4 + t] = uint(%(b1)s); }
     if (!cslot && !czero) { s[192 + g * 4 + t] = uint(%(acc0)s); s[192 + (g + 8) * 4 + t] = uint(%(acc1)s); }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     if (!areuse && adirect) {
@@ -89,7 +90,11 @@ HMMA_BODY = '''{
     // flags (no slot bits); working in acc[0..1] it overwrote the accumulator a chain held there between its two calls (Ocarina of Time's agl_ndsr_vr networks: 2,515 such
     // calls in 30 shaders, dotted rows across fog and light, GitHub issue #1537). The flags are constants at each inlined call, so the copies cost nothing
     simdgroup_half8x8 b0, b1, c0, c1;
-    simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
+    if (bmode == 2) { b0 = bm[bk]; b1 = bm[bk + 1]; }   // B kept from an earlier call (see hmma_bslots)
+    else {
+        simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
+        if (bmode == 1) { bm[bk] = b0; bm[bk + 1] = b1; }
+    }
     if (czero) { simdgroup_multiply(c0, am[0], b0); simdgroup_multiply(c1, am[2], b0); }
     else {
         if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
@@ -124,6 +129,40 @@ def block_end(src, start):   # the index of the brace closing the block opened a
         depth += 1 if b.group() == '{' else -1
         if depth == 0: return b.start()
     raise ValueError('dmsh_hmma16816_f16: block not closed')
+# B kept in the SIMD-group's registers: a call's B is the same pair of words as an earlier call's (agl's NDSR networks: the weights, read once at the top, each pair used by 8
+# calls; an activation pair used by two calls), so its two matrices go through the scratch block once. Two calls have the same B when their two arguments are the same expression
+# of copies (spirv-cross's `int a = as_type<int>(b);`) down to variables assigned once in the function and never handed to a call's out parameter (D1), so the words are equal
+# wherever both calls run. The first call of a pair keeps its matrices in a slot (dm_bm, two matrices) when it is a statement of the function's top level (not in a branch or a
+# loop), so it runs before every later call; a later call of the pair takes them from the slot (dm_bf: mode 1 keep, 2 take, slot << 2; 0 through the block as before).
+# Ocarina of Time's fa3033d05c0a41d6 (agl_ndsr_vr_light, 177 HMMAs a thread, every frame): 118 of them take B from a slot, 779 -> 655 us on an M4 Pro, the same output bit for bit.
+# The slots replace the words they were made from, which the calls alone read, so they hold no more registers than the words did. Returns ([dm_bf a call], slots)
+HB_COPY = re.compile(r'^[ \t]+(?:int|uint|float|half|short|ushort) (_\d+) = ((?:as_type<\w+>|int|uint|float)\((_\w+(?:\.[xyzw])?)\)|(_\w+));$', re.M)
+def hmma_bslots(fb, args, at):
+    assigned = {}
+    for x in re.finditer(r'(?<![\w.\]])(_\w+)\s*=(?!=)', fb): assigned[x.group(1)] = assigned.get(x.group(1), 0) + 1
+    out = {a[17] for a in args}   # D1, written by the call
+    copies = {x.group(1): (x.group(3) or x.group(4), x.group(2)) for x in HB_COPY.finditer(fb)}
+    def canon(v, depth=0):   # the expression of copies v stands for, or None
+        if assigned.get(v.split('.')[0], 0) != 1 or v.split('.')[0] in out or depth > 64: return None
+        if v not in copies: return v
+        src, expr = copies[v]
+        inner = canon(src, depth + 1)
+        return None if inner is None else expr.replace(src, '{' + inner + '}', 1) if expr != src else inner
+    keys = []
+    for a, pos in zip(args, at):
+        line = fb[fb.rfind('\n', 0, pos) + 1:pos]
+        k = (canon(a[6]), canon(a[7]))
+        keys.append((None if None in k else k, re.fullmatch(r'    \S.*', line) is not None))
+    left = {}   # the calls of each pair still to come
+    for k, _ in keys:
+        if k: left[k] = left.get(k, 0) + 1
+    slots, flags = {}, []
+    for k, top in keys:
+        if k: left[k] -= 1
+        if k and k in slots: flags.append(2 | slots[k] << 2)
+        elif k and left[k] and top: slots[k] = 2 * len(slots); flags.append(1 | slots[k] << 2)
+        else: flags.append(0)
+    return flags, 2 * len(slots)
 def hmma_msl(msl):
     m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
     if not m: return msl
@@ -157,12 +196,17 @@ def hmma_msl(msl):
     if not calls: return msl
     shared = set(callers.values())
     direct = len(shared) == 1 and None not in shared
-    extra = ', thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4]' + (', threadgroup %s& dm_shm' % next(iter(shared))[0] if direct else '')
+    extra = ', thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4]' + (', threadgroup %s& dm_shm' % next(iter(shared))[0] if direct else '') + ', thread simdgroup_half8x8 *bm, const int dm_bf'
+    bf, nb = {}, {}
+    for open_at in callers:
+        mine = [c for c, o in calls if o == open_at]
+        flags, nb[open_at] = hmma_bslots(msl[open_at:block_end(msl, open_at) + 1], [split_params(c.group(1)) for c in mine], [c.start() - open_at for c in mine])
+        bf.update(zip([c.start() for c in mine], flags))
     v.update(adirect='(f & 16) != 0' if direct else 'false', shm_base='(threadgroup half*)&dm_shm[0]' if direct else '(threadgroup half*)nullptr')
     # Edits of the original text, applied from its end: the helper itself, each call's added arguments (the caller's matrices and shared memory), each caller's matrices
     edits = [(m.start(), body_end + 1, '\n%s dmsh_hmma16816_f16(%s%s)\n%s' % (m.group(1), m.group(2), extra, HMMA_BODY % v))]   # spirv-cross has it inlined (always_inline, the line before)
-    edits += [(c.end() - 1, c.end() - 1, ', dm_acc, dm_am' + (', ' + callers[open_at][1] if direct else '')) for c, open_at in calls]
-    edits += [(open_at + 2, open_at + 2, '    simdgroup_half8x8 dm_acc[16], dm_am[4];\n') for open_at in callers]
+    edits += [(c.end() - 1, c.end() - 1, ', dm_acc, dm_am' + (', ' + callers[open_at][1] if direct else '') + ', dm_bm, %d' % bf[c.start()]) for c, open_at in calls]
+    edits += [(open_at + 2, open_at + 2, '    simdgroup_half8x8 dm_acc[16], dm_am[4], dm_bm[%d];\n' % max(nb[open_at], 2)) for open_at in callers]
     for a, b, text in sorted(edits, key=lambda e: e[0], reverse=True):
         msl = msl[:a] + text + msl[b:]
     return msl
@@ -289,6 +333,21 @@ def tg_spill(msl):
 # textureGatherOffsets: spirv-cross's spvGatherConstOffsets passes coffsets[i] from a loop to gather(), whose offset Metal takes only as a constant expression. At -O1 the loop stays and
 # the compiler takes it anyway: the gathers then read texels at offsets that differ between lanes and between runs, with no error. agl's NDSR upscaler builds its input tile this way, so
 # some of its lanes saw zeros and the network drew dotted rows in smooth areas of the picture (the same frame, three pictures). Each call becomes its four gathers, offsets written out
+# Four offsets that are one 2x2 footprint (agl's NDSR: (0,0) (1,0) (0,1) (1,1), 48 gathers a thread in Ocarina of Time's fa3033d05c0a41d6) are one gather: component w of the gather at
+# offset b + d is the texel b + d of the gather at offset b, which is its component (0,0) w, (1,0) z, (0,1) x, (1,1) y. Each texel's address goes through the sampler's wrap on its own
+# either way, so the result is the same; a quarter of the gathers (fa3033d05c0a41d6: 842 -> 771 us on an M4 Pro). Returns (offset b, swizzle) or None
+GATHER_COMP = {(0, 0): 'w', (1, 0): 'z', (0, 1): 'x', (1, 1): 'y'}
+def gather_quad(off):
+    xy = []
+    for o in off:
+        v = [int(x) for x in re.findall(r'-?\d+', o[o.index('(') + 1:])]
+        if len(v) == 1: v = v * 2
+        if len(v) != 2: return None
+        xy.append(tuple(v))
+    bx, by = min(x for x, _ in xy), min(y for _, y in xy)
+    comp = [GATHER_COMP.get((x - bx, y - by)) for x, y in xy]
+    if None in comp or not (-8 <= bx <= 7 and -8 <= by <= 7): return None
+    return 'int2(%d, %d)' % (bx, by), ''.join(comp)
 GATHER4 = 'template<typename T> static inline __attribute__((always_inline)) vec<T, 4> dm_gather4(T a, T b, T c, T d) { return vec<T, 4>(a, b, c, d); }\n'
 def gather_offsets(msl):
     if not re.search(r'\bspvGather(Compare)?ConstOffsets\(spvDesc|= spvGather(Compare)?ConstOffsets\(', msl): return msl
@@ -311,7 +370,9 @@ def gather_offsets(msl):
         tex, smp, off, rest = args[0], args[1], arrays[args[2]], ', '.join(args[base:])
         tail = '' if cmp else ', ' + args[3]
         fn = 'gather_compare' if cmp else 'gather'
-        out += [msl[i:m.start()], 'dm_gather4(' + ', '.join(f'{tex}.{fn}({smp}, {rest}, {o}{tail}).w' for o in off) + ')']
+        quad = gather_quad(off)
+        if quad: out += [msl[i:m.start()], f'{tex}.{fn}({smp}, {rest}, {quad[0]}{tail}).{quad[1]}']
+        else: out += [msl[i:m.start()], 'dm_gather4(' + ', '.join(f'{tex}.{fn}({smp}, {rest}, {o}{tail}).w' for o in off) + ')']
         i = j
     out.append(msl[i:])
     msl = ''.join(out)
