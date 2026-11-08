@@ -661,7 +661,7 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
 // The colour pass draws the grass with depth EQUAL against the depth pre-pass's mesh shaders, so the kernels' positions must be bit-identical to their [[invariant]] ones: the entries'
 // sources carry "#pragma clang fp contract(off) reassociate(off)" (mkcpre2.py), the flags -fpreserve-invariance gives an invariant output's chain. Without it the compiler fused other
 // multiply-adds in the kernel's copy of the body, positions came out 1 ulp off and those blades failed the EQUAL test, leaving white specks (grass.md 4.4)
-enum { CPRE_SLOT = 30, CPRE_MAX = 32, CPRE_HDR = 16, CPRE_MAGIC = 0x43505245 };
+enum { CPRE_SLOT = 30, CPRE_MAX = 32, CPRE_HDR = 16, CPRE_MAGIC = 0x43505245, CPRE_DONE = 0x444f4e45 };
 static struct { int n, ready, done; struct { NvShader *ts, *ms, *fs; NvProg *pr; typeof(S) st; p_set_rt rt; uint64_t rec, cg, ag, tgpu, mgpu, fgpu; NSUInteger tai, mai, fai; size_t ioff, ilen; uint32_t cap, tcap; } d[CPRE_MAX];   // tgpu / mgpu / fgpu: the task, mesh and pixel stages' argument tables as written at the draw (the uniform ring blocks of that moment)
                 uint64_t draws, flushes, lost, splits, dispatches, clamped; } g_cpre;
 static nvn_hmap g_pso_cpre = {.klen = sizeof(pso_key)};
@@ -705,9 +705,9 @@ static int cpre_args_ps(void) {
     static dispatch_once_t once; static int ok;
     dispatch_once(&once, ^{ NSError *e = nil;
         id<MTLLibrary> l = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
-            "kernel void dm_cpre_args(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(rec[0], hdr[1]); args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u; args[4] = n * hdr[2]; args[5] = 1u; args[6] = 0u; args[7] = 0u; args[8] = 0u; args[9] = rec[0]; }\n"
+            "kernel void dm_cpre_args(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(rec[0], hdr[1]); args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u; args[4] = n * hdr[2]; args[5] = 1u; args[6] = 0u; args[7] = 0u; args[8] = 0u; args[9] = rec[0]; args[15] = 0x444f4e45u; }\n"
             "kernel void dm_cpre_targs(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(rec[0], hdr[4]); args[0] = n; args[1] = 1u; args[2] = 1u; args[3] = 0u; args[4] = 0u; args[5] = 1u; args[6] = 0u; args[7] = 0u; args[8] = 0u; args[9] = rec[0]; hdr[7] = 0u; }\n"
-            "kernel void dm_cpre_margs(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(hdr[7], hdr[1]); args[12] = n; args[13] = 1u; args[14] = 1u; args[4] = n * hdr[2]; }\n" options:nil error:&e];
+            "kernel void dm_cpre_margs(device const uint* rec [[buffer(0)]], device uint* hdr [[buffer(1)]], device uint* args [[buffer(2)]]) { uint n = min(hdr[7], hdr[1]); args[12] = n; args[13] = 1u; args[14] = 1u; args[4] = n * hdr[2]; args[15] = 0x444f4e45u; }\n" options:nil error:&e];
         const char *names[3] = {"dm_cpre_args", "dm_cpre_targs", "dm_cpre_margs"}; ok = l != nil;
         for (int i = 0; ok && i < 3; i++) { id<MTLFunction> f = [l newFunctionWithName:@(names[i])]; g_cpre_args_ps[i] = f ? cps_new(f, &e) : nil; if (!g_cpre_args_ps[i]) ok = 0; }
         if (!ok) MLOG("[RED] compute pre-pass: the argument kernels did not build: %s", e.localizedDescription.UTF8String); });
@@ -757,23 +757,33 @@ static int cpre_record(NvProg *pr, NvShader *ts, NvShader *ms, NvShader *fs, uin
     if (g_cpre.n >= CPRE_MAX) { g_cpre.lost++; return 0; }
     if (g_cpre.n && g_enc) { g_cpre.lost += (uint64_t)g_cpre.n; g_cpre.n = 0; g_cpre.ready = 0; g_cpre.done = 0; }   // dispatched but never flushed (no draw followed in a pass): dropped
     image_prepare(pr, 1u << 1);   // the pixel stage's images (uploads, views), as draw_ would have done for the mesh path's raster program
-    uint32_t seen = g_mtk.mem_count, fan = 0, ran = 0, ranm = 0;   // last frame's buffers as the GPU left them: the mesh counter (task draws), the dispatch counts
-    const uint32_t *rh = ms->cpre_rb ? (const uint32_t *)((const uint8_t *)ms->cpre_rb.contents + ms->cpre_rb_off) : NULL; if (rh && (rh[9] != CPRE_MAGIC || rh[10] != ms->cpre_rb_frame)) rh = NULL;   // recycled meanwhile
-    const uint32_t *ra = ms->cpre_ra ? (const uint32_t *)((const uint8_t *)ms->cpre_ra.contents + ms->cpre_ra_off) : NULL; if (ra && (ra[10] != CPRE_MAGIC || ra[11] != ms->cpre_rb_frame)) ra = NULL;
-    if (rh) { fan = rh[7]; if (fan > 65536) fan = 0; ms->cpre_fan = fan; if (ts && fan > rh[1]) { g_cpre.clamped++; static int said; if (said++ < 4) MLOG("[RED] compute pre-pass: mesh %s: a fan-out of %u mesh threadgroups, the cap held %u (cut off for a frame; the cap follows)", ms->key, fan, rh[1]); } }
-    uint32_t want = 0;   // last frame's record count before the clamp (args[9]): above the cap it was, part of the draw was cut off (counted, logged once, and the next cap covers it)
+    uint32_t seen = g_mtk.mem_count, fan = 0, ran = 0, ranm = 0, want = 0;   // the record as the CPU sees it; from the newest finished readback: the dispatch counts, the counts before the clamps
+    // Readbacks: the last 4 draws' header and argument buffers of this mesh shader; the newest one the GPU has finished (args[15] = CPRE_DONE, written by the draw's last argument kernel) is
+    // read and it and the older ones dropped. With the frame translated ahead of the GPU (DM_NVN_PRE_XLATE, chunk merge) last frame's buffers are often not run yet and the record as the CPU
+    // sees it is 0: the caps then come from the peaks below, never from those alone (the iPad's v20b drew most grass white: caps of 32 / 64 against 313 / 1,456 threadgroups)
+    const uint32_t *rh = NULL, *ra = NULL;
+    for (int q = 0; q < 4; q++) { int i = (int)((ms->cpre_qi + 3 - q) & 3); if (!ms->cpre_qa[i]) continue;
+        const uint32_t *a = (const uint32_t *)((const uint8_t *)ms->cpre_qa[i].contents + ms->cpre_qa_off[i]), *h = (const uint32_t *)((const uint8_t *)ms->cpre_qb[i].contents + ms->cpre_qb_off[i]);
+        if (a[10] != CPRE_MAGIC || a[11] != ms->cpre_qf[i] || h[9] != CPRE_MAGIC || h[10] != ms->cpre_qf[i]) { ms->cpre_qa[i] = nil; ms->cpre_qb[i] = nil; continue; }   // recycled meanwhile
+        if (a[15] != CPRE_DONE) continue;   // not run yet
+        ra = a; rh = h; for (int k = q; k < 4; k++) { int o = (int)((ms->cpre_qi + 3 - k) & 3); if (k > q) { ms->cpre_qa[o] = nil; ms->cpre_qb[o] = nil; } } break; }
+    if (rh && ts) { fan = rh[7]; if (fan > 65536) fan = 0; ms->cpre_fan = fan; if (fan > rh[1]) { g_cpre.clamped++; static int said; if (said++ < 4) MLOG("[RED] compute pre-pass: mesh %s: a fan-out of %u mesh threadgroups, the cap held %u (cut off for a frame; the cap follows)", ms->key, fan, rh[1]); } }
     if (ra) { ran = ra[0]; ranm = ra[12]; want = ra[9]; if (want > ran) { g_cpre.clamped++; static int said; if (said++ < 4) MLOG("[RED] compute pre-pass: mesh %s: %u %s threadgroups recorded, the cap held %u (cut off for a frame; the cap follows)", ms->key, want, ts ? "task" : "mesh", ran); } }
+    if (ra) {   // peaks of the true counts, decaying by 1/32 a finished readback
+        uint32_t pk = ms->cpre_pk_set ? ms->cpre_pk - ms->cpre_pk / 32 : 0, pkf = ms->cpre_pk_set ? ms->cpre_pkf - ms->cpre_pkf / 32 : 0;
+        ms->cpre_pk = want > pk ? want : pk; ms->cpre_pkf = fan > pkf ? fan : pkf; ms->cpre_pk_set = 1; }
     if (gp_active() && rh) {   // diagnostic: last frame's slice 0 as the pass-through reads it: vertex 0's words (hex = float), the packed id (a0) of vertices 0-7, the first indices
         const uint32_t *h = rh; const uint32_t *sl = h + h[3]; const uint32_t *ix = h + h[0]; if (h[3] < CPRE_HDR + (size_t)h[1] * h[2] + 1 && h[0] == CPRE_HDR) {
         char buf[640]; int o = 0; for (int k = 0; k < 20 && o < 400; k++) { uint32_t w = sl[36 + 32 * k]; float f; memcpy(&f, &w, 4); o += snprintf(buf + o, sizeof buf - o, " %08x=%.4g", w, (double)f); }
         for (int n = 0; n < 8 && o < 600; n++) o += snprintf(buf + o, sizeof buf - o, "%s%08x", n ? " " : "; a0 of vertices 0-7:", sl[36 + (n / 32) * 800 + n % 32 + 128]);
         MLOG("[mtk-rb] mesh %s: v0 words%s; indices %u %u %u %u %u %u", ms->key, buf, ix[0], ix[1], ix[2], ix[3], ix[4], ix[5]); } }
-    // Caps (the buffer's threadgroups; the GPU touches only those dispatched, so a cap costs memory, not traffic): v2's margins, 2x the record as the CPU sees it + 64 (task-fed: 4x, or
-    // 1.5x last frame's fan-out), and at least last frame's count before the clamp. Tighter margins (1.5x + 32) cut whole grass patches off in the dialog (zr_grass_ab7, white
-    // patches: the record the GPU writes in this submission runs ahead of the CPU's view of it), for ~20 % of the ~37 MB a frame
-    uint32_t base = seen > want ? seen : want;
+    // Caps (the buffer's threadgroups; the GPU touches only those dispatched, so a cap costs memory, not traffic): 2x the larger of the record as the CPU sees it and the peak record count
+    // + 64 (task-fed meshes: 1.5x the fan-out peak, at least 4x that, + 64); before any readback has finished, generous defaults (128 records, a fan-out of 1,024). Margins of 1.5x + 32
+    // cut whole grass patches off (zr_grass_ab7)
+    uint32_t pk = ms->cpre_pk_set ? ms->cpre_pk : 128, pkf = ms->cpre_pk_set ? ms->cpre_pkf : 1024;
+    uint32_t base = seen > pk ? seen : pk;
     uint32_t tcap = ts ? cpre_clamp(base * 2 + 32, 32, 2048) : 0;
-    uint32_t cap = cpre_cap_env() ? cpre_cap_env() : ts ? cpre_clamp((fan > base * 4 ? fan + fan / 2 : base * 4) + 64, 64, 4096) : cpre_clamp(base * 2 + 64, 64, 4096);
+    uint32_t cap = cpre_cap_env() ? cpre_cap_env() : ts ? cpre_clamp((pkf + pkf / 2 > base * 4 ? pkf + pkf / 2 : base * 4) + 64, 64, 4096) : cpre_clamp(base * 2 + 64, 64, 4096);
     size_t iw = (size_t)cap * ms->cpre_maxp * 3, sw = (size_t)cap * ms->cpre_sw, tw = (size_t)tcap * ms->cpre_tsw, lw = ts ? cap : 0;
     size_t total = CPRE_HDR + iw + sw + tw + lw;
     id<MTLBuffer> cb; size_t co;
@@ -800,6 +810,7 @@ static int cpre_record(NvProg *pr, NvShader *ts, NvShader *ms, NvShader *fs, uin
     g_args_dirty[1] = 1; g_cpre_rec_gpu = 0; encode_args((id)nil, fs, 1, 0); d->fgpu = g_cpre_rec_gpu; d->fai = g_cpre_rec_ai;
     g_cpre_args = 0; args_dirty_all();
     ms->cpre_rb = cb; ms->cpre_rb_off = co; ms->cpre_ra = ab; ms->cpre_ra_off = ao;
+    { uint32_t qi = ms->cpre_qi++ & 3; ms->cpre_qa[qi] = ab; ms->cpre_qa_off[qi] = ao; ms->cpre_qb[qi] = cb; ms->cpre_qb_off[qi] = co; ms->cpre_qf[qi] = fr; }
     g_cpre.draws++;
     { static int imm = -1; if (imm < 0) imm = getenv("DM_NVN_MESH_CPRE_IMM") != NULL; if (imm || cap_dbg) cpre_dispatch(); }   // a DBG capture: now, so the mesh path's draw that follows flushes it   // DM_NVN_MESH_CPRE_IMM=1 (test): now, not at the next pass: an encoder begun later lands the uniform updates the game makes for the draws after this one (ubd_land_compute), and the kernels would read them
     if (gp_active()) MLOG("[mtk] F%llu pass %llu task %s mesh %s fs %s: compute pre-pass (the record as the CPU sees it) threadgroups %u first %u, task cap %u mesh cap %u, %zu KB; last frame as the GPU left it: %u task / %u mesh threadgroups dispatched, fan-out %u; cut off by a cap so far %llu", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_stat_pass, ts ? ts->key : "-", ms->key, fs->key, seen, g_mtk.mem_first,
