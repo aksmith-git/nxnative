@@ -44,7 +44,7 @@ class ShaderCache(unittest.TestCase):
                        XC=['--msl'], MAC_RECORD='mac flags', IOSOUT=None, TARGETS={'mac'},
                        ios_metal=types.SimpleNamespace(RECORD='ios flags'), METAL_FP='tested Metal and SDK',
                        FACTS={}, MAP_ROWS={}, MAP_CONFLICT_ROWS={}, CODE_FP='source', PROFILE_ROWS=b'', PAIRS={},
-                       DUAL_WANT=set(), BF_WANT=set(), STORE=shader_cache.Store(root / 'cas.db'), out=str(root / 'out'),
+                       DUAL_WANT=set(), REDSUM=False, BF_WANT=set(), STORE=shader_cache.Store(root / 'cas.db'), out=str(root / 'out'),
                        CHAIN='test-chain', clone=shutil.copyfile, shader_rule_source=lambda name: b'',
                        STAGE='stage/test', want=set(), OUT_KEY=re.compile(r'([0-9a-f]{16})_b'), OLD_IMAGE={}, shader_lib=shader_lib, romfs=romfs, shutil=shutil,
                        STAMP_BEFORE=None, INPUTS='inputs')
@@ -79,6 +79,13 @@ class ShaderCache(unittest.TestCase):
                 self.assertTrue(self.ns['restore_cache']('key', old))
                 self.ns['METAL_FP'] = 'tested Metal and SDK'
                 self.assertFalse(self.ns['restore_cache']('key', self.digest()))
+
+    def test_redsum_switch_changes_the_key(self):   # DMSH_REDSUM overrides the profile's shader_redsum, which PROFILE_ROWS carries: the override must not take the profile's outputs
+        off = self.digest()
+        self.ns['REDSUM'] = True
+        self.assertNotEqual(self.digest(), off)
+        self.ns['REDSUM'] = False
+        self.assertEqual(self.digest(), off)
 
     def test_dual_source_membership_change_rejects_cached_library(self):
         for ios in (False, True):

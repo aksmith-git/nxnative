@@ -35,6 +35,10 @@ sys_resource	0x3000000
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=layout
 shader_note	Ocarina of Time shaders
+# Float atomic adds whose old value is not used (the exposure and cubemap-to-SH reductions: 256 threads, or 96 groups of them, adding into 1-4 words through the translator's
+# compare-and-swap loop) become a SIMD-group sum and one native float add (dm/gfx/tools/dmsh_redsum.py). 6 compute shaders, 23 loops; on an M5 1bba09ec4bc8ff67 361 -> 9 us,
+# 6e28359aa3558f61 289 -> 70 us, 0.69 ms of the frame. DMSH_REDSUM=0 builds without it
+shader_redsum	on
 
 # ---- Frame rate ----
 # The game steps its time by a frame ratio, its base rate / its frame rate, whatever the frame took: frames longer than a vsync played in slow motion. The ratio takes the host's
