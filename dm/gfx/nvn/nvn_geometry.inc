@@ -911,6 +911,12 @@ static void cpre_flush(id en_) {
         if (mesh) [en drawMeshThreadgroupsWithIndirectBuffer:d->ag + (d->ts ? 48 : 0) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
         else enc_r_draw_indexed_indirect(en, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt32, d->cg + d->ioff, d->ilen, d->ag + 16);
         g_stat_draw++;
+        // The pass's store decision must see these draws' writes as draw_ notes its own (udc_note_draw, under the draw's saved S): in a pass of their own (cpre_prepass) they are the
+        // pass's only draws, and with nothing noted its colour attachment was "loaded and unwritten" -> DontCare store (DM_NVN_UNWRITTEN_DC), so the grass and leaves drawn there were
+        // discarded and their pixels kept the colour target's earlier contents: black silhouettes over the depth pass's foliage (Deku Tree 1F)
+        { uint32_t rm = 0, outs = d->fs->rf.color_known ? d->fs->rf.color_mask : UINT32_MAX;
+          if (!S.rast_discard) for (int k = 0; k < 8; k++) if (((S.chmask.mask >> (4 * k)) & 0xf) && (outs >> k & 1)) rm |= 1u << k;
+          udc_note_draw(d->pr, rm); }
     }
     for (int i = 0; i < n; i++) { g_cpre.d[i].ts = nil; g_cpre.d[i].ms = nil; g_cpre.d[i].fs = nil; g_cpre.d[i].pr = nil; }
     S = s0;
